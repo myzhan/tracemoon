@@ -2,6 +2,18 @@
 
 A sampling profiler for Lua 5.4 and 5.5, inspired by [py-spy](https://github.com/benfred/py-spy). Attach to a running Lua process, capture mixed Lua + C call stacks, and generate interactive flamegraph SVGs. It also profiles [skynet](https://github.com/cloudwu/skynet) processes that host many Lua VMs in a single process.
 
+## Example flamegraphs
+
+Plain single-VM Lua — the native C chain (`_libc_start_main → main → luaV_execute → …`) is unwound and merged beneath the Lua frames:
+
+[![single-VM Lua flamegraph](assets/flamegraph-lua.svg)](assets/flamegraph-lua.svg)
+
+skynet — each service's Lua VM is rendered under its own `[service:name]` root frame (native C merge is intentionally skipped in multi-VM mode):
+
+[![skynet flamegraph](assets/flamegraph-skynet.svg)](assets/flamegraph-skynet.svg)
+
+> These are static previews. Open the SVGs locally (or run your own `record`) for the fully interactive, zoomable flamegraph.
+
 ## Features
 
 - **Zero instrumentation** - attaches to running Lua processes without modification

@@ -10,6 +10,9 @@ Cargo.lock
 profile.*
 flamegraph.*
 
+# ...but keep the sample flamegraphs referenced from the README
+!assets/*.svg
+
 # IDE
 .idea/
 .vscode/

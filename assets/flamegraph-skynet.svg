@@ -1,0 +1,491 @@
+<?xml version="1.0" standalone="no"?><!DOCTYPE svg PUBLIC "-//W3C//DTD SVG 1.1//EN" "http://www.w3.org/Graphics/SVG/1.1/DTD/svg11.dtd"><svg version="1.1" width="1200" height="198" onload="init(evt)" viewBox="0 0 1200 198" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" xmlns:fg="http://github.com/jonhoo/inferno"><!--Flame graph stack visualization. See https://github.com/brendangregg/FlameGraph for latest version, and http://www.brendangregg.com/flamegraphs.html for examples.--><!--NOTES: --><defs><linearGradient id="background" y1="0" y2="1" x1="0" x2="0"><stop stop-color="#eeeeee" offset="5%"/><stop stop-color="#eeeeb0" offset="95%"/></linearGradient></defs><style type="text/css">
+text { font-family:monospace; font-size:12px }
+#title { text-anchor:middle; font-size:17px; }
+#matched { text-anchor:end; }
+#search { text-anchor:end; opacity:0.1; cursor:pointer; }
+#search:hover, #search.show { opacity:1; }
+#subtitle { text-anchor:middle; font-color:rgb(160,160,160); }
+#unzoom { cursor:pointer; }
+#frames > *:hover { stroke:black; stroke-width:0.5; cursor:pointer; }
+.hide { display:none; }
+.parent { opacity:0.5; }
+</style><script type="text/ecmascript"><![CDATA[
+        var nametype = 'Function:';
+        var fontsize = 12;
+        var fontwidth = 0.59;
+        var xpad = 10;
+        var inverted = false;
+        var searchcolor = 'rgb(230,0,230)';
+        var fluiddrawing = true;
+        var truncate_text_right = false;
+    ]]><![CDATA["use strict";
+var details, searchbtn, unzoombtn, matchedtxt, svg, searching, frames, known_font_width;
+function init(evt) {
+    details = document.getElementById("details").firstChild;
+    searchbtn = document.getElementById("search");
+    unzoombtn = document.getElementById("unzoom");
+    matchedtxt = document.getElementById("matched");
+    svg = document.getElementsByTagName("svg")[0];
+    frames = document.getElementById("frames");
+    known_font_width = get_monospace_width(frames);
+    total_samples = parseInt(frames.attributes.total_samples.value);
+    searching = 0;
+
+    // Use GET parameters to restore a flamegraph's state.
+    var restore_state = function() {
+        var params = get_params();
+        if (params.x && params.y)
+            zoom(find_group(document.querySelector('[*|x="' + params.x + '"][y="' + params.y + '"]')));
+        if (params.s)
+            search(params.s);
+    };
+
+    if (fluiddrawing) {
+        // Make width dynamic so the SVG fits its parent's width.
+        svg.removeAttribute("width");
+        // Edge requires us to have a viewBox that gets updated with size changes.
+        var isEdge = /Edge\/\d./i.test(navigator.userAgent);
+        if (!isEdge) {
+            svg.removeAttribute("viewBox");
+        }
+        var update_for_width_change = function() {
+            if (isEdge) {
+                svg.attributes.viewBox.value = "0 0 " + svg.width.baseVal.value + " " + svg.height.baseVal.value;
+            }
+
+            // Keep consistent padding on left and right of frames container.
+            frames.attributes.width.value = svg.width.baseVal.value - xpad * 2;
+
+            // Text truncation needs to be adjusted for the current width.
+            update_text_for_elements(frames.children);
+
+            // Keep search elements at a fixed distance from right edge.
+            var svgWidth = svg.width.baseVal.value;
+            searchbtn.attributes.x.value = svgWidth - xpad;
+            matchedtxt.attributes.x.value = svgWidth - xpad;
+        };
+        window.addEventListener('resize', function() {
+            update_for_width_change();
+        });
+        // This needs to be done asynchronously for Safari to work.
+        setTimeout(function() {
+            unzoom();
+            update_for_width_change();
+            restore_state();
+        }, 0);
+    } else {
+        restore_state();
+    }
+}
+// event listeners
+window.addEventListener("click", function(e) {
+    var target = find_group(e.target);
+    if (target) {
+        if (target.nodeName == "a") {
+            if (e.ctrlKey === false) return;
+            e.preventDefault();
+        }
+        if (target.classList.contains("parent")) unzoom();
+        zoom(target);
+
+        // set parameters for zoom state
+        var el = target.querySelector("rect");
+        if (el && el.attributes && el.attributes.y && el.attributes["fg:x"]) {
+            var params = get_params()
+            params.x = el.attributes["fg:x"].value;
+            params.y = el.attributes.y.value;
+            history.replaceState(null, null, parse_params(params));
+        }
+    }
+    else if (e.target.id == "unzoom") {
+        unzoom();
+
+        // remove zoom state
+        var params = get_params();
+        if (params.x) delete params.x;
+        if (params.y) delete params.y;
+        history.replaceState(null, null, parse_params(params));
+    }
+    else if (e.target.id == "search") search_prompt();
+}, false)
+// mouse-over for info
+// show
+window.addEventListener("mouseover", function(e) {
+    var target = find_group(e.target);
+    if (target) details.nodeValue = nametype + " " + g_to_text(target);
+}, false)
+// clear
+window.addEventListener("mouseout", function(e) {
+    var target = find_group(e.target);
+    if (target) details.nodeValue = ' ';
+}, false)
+// ctrl-F for search
+window.addEventListener("keydown",function (e) {
+    if (e.keyCode === 114 || (e.ctrlKey && e.keyCode === 70)) {
+        e.preventDefault();
+        search_prompt();
+    }
+}, false)
+// functions
+function get_params() {
+    var params = {};
+    var paramsarr = window.location.search.substr(1).split('&');
+    for (var i = 0; i < paramsarr.length; ++i) {
+        var tmp = paramsarr[i].split("=");
+        if (!tmp[0] || !tmp[1]) continue;
+        params[tmp[0]]  = decodeURIComponent(tmp[1]);
+    }
+    return params;
+}
+function parse_params(params) {
+    var uri = "?";
+    for (var key in params) {
+        uri += key + '=' + encodeURIComponent(params[key]) + '&';
+    }
+    if (uri.slice(-1) == "&")
+        uri = uri.substring(0, uri.length - 1);
+    if (uri == '?')
+        uri = window.location.href.split('?')[0];
+    return uri;
+}
+function find_child(node, selector) {
+    var children = node.querySelectorAll(selector);
+    if (children.length) return children[0];
+    return;
+}
+function find_group(node) {
+    var parent = node.parentElement;
+    if (!parent) return;
+    if (parent.id == "frames") return node;
+    return find_group(parent);
+}
+function orig_save(e, attr, val) {
+    if (e.attributes["fg:orig_" + attr] != undefined) return;
+    if (e.attributes[attr] == undefined) return;
+    if (val == undefined) val = e.attributes[attr].value;
+    e.setAttribute("fg:orig_" + attr, val);
+}
+function orig_load(e, attr) {
+    if (e.attributes["fg:orig_"+attr] == undefined) return;
+    e.attributes[attr].value = e.attributes["fg:orig_" + attr].value;
+    e.removeAttribute("fg:orig_" + attr);
+}
+function g_to_text(e) {
+    var text = find_child(e, "title").firstChild.nodeValue;
+    return (text)
+}
+function g_to_func(e) {
+    var func = g_to_text(e);
+    // if there's any manipulation we want to do to the function
+    // name before it's searched, do it here before returning.
+    return (func);
+}
+function get_monospace_width(frames) {
+    // Given the id="frames" element, return the width of text characters if
+    // this is a monospace font, otherwise return 0.
+    text = find_child(frames.children[0], "text");
+    originalContent = text.textContent;
+    text.textContent = "!";
+    bangWidth = text.getComputedTextLength();
+    text.textContent = "W";
+    wWidth = text.getComputedTextLength();
+    text.textContent = originalContent;
+    if (bangWidth === wWidth) {
+        return bangWidth;
+    } else {
+        return 0;
+    }
+}
+function update_text_for_elements(elements) {
+    // In order to render quickly in the browser, you want to do one pass of
+    // reading attributes, and one pass of mutating attributes. See
+    // https://web.dev/avoid-large-complex-layouts-and-layout-thrashing/ for details.
+
+    // Fall back to inefficient calculation, if we're variable-width font.
+    // TODO This should be optimized somehow too.
+    if (known_font_width === 0) {
+        for (var i = 0; i < elements.length; i++) {
+            update_text(elements[i]);
+        }
+        return;
+    }
+
+    var textElemNewAttributes = [];
+    for (var i = 0; i < elements.length; i++) {
+        var e = elements[i];
+        var r = find_child(e, "rect");
+        var t = find_child(e, "text");
+        var w = parseFloat(r.attributes.width.value) * frames.attributes.width.value / 100 - 3;
+        var txt = find_child(e, "title").textContent.replace(/\([^(]*\)$/,"");
+        var newX = format_percent((parseFloat(r.attributes.x.value) + (100 * 3 / frames.attributes.width.value)));
+
+        // Smaller than this size won't fit anything
+        if (w < 2 * known_font_width) {
+            textElemNewAttributes.push([newX, ""]);
+            continue;
+        }
+
+        // Fit in full text width
+        if (txt.length * known_font_width < w) {
+            textElemNewAttributes.push([newX, txt]);
+            continue;
+        }
+
+        var substringLength = Math.floor(w / known_font_width) - 2;
+        if (truncate_text_right) {
+            // Truncate the right side of the text.
+            textElemNewAttributes.push([newX, txt.substring(0, substringLength) + ".."]);
+            continue;
+        } else {
+            // Truncate the left side of the text.
+            textElemNewAttributes.push([newX, ".." + txt.substring(txt.length - substringLength, txt.length)]);
+            continue;
+        }
+    }
+
+    console.assert(textElemNewAttributes.length === elements.length, "Resize failed, please file a bug at https://github.com/jonhoo/inferno/");
+
+    // Now that we know new textContent, set it all in one go so we don't refresh a bazillion times.
+    for (var i = 0; i < elements.length; i++) {
+        var e = elements[i];
+        var values = textElemNewAttributes[i];
+        var t = find_child(e, "text");
+        t.attributes.x.value = values[0];
+        t.textContent = values[1];
+    }
+}
+
+function update_text(e) {
+    var r = find_child(e, "rect");
+    var t = find_child(e, "text");
+    var w = parseFloat(r.attributes.width.value) * frames.attributes.width.value / 100 - 3;
+    var txt = find_child(e, "title").textContent.replace(/\([^(]*\)$/,"");
+    t.attributes.x.value = format_percent((parseFloat(r.attributes.x.value) + (100 * 3 / frames.attributes.width.value)));
+
+    // Smaller than this size won't fit anything
+    if (w < 2 * fontsize * fontwidth) {
+        t.textContent = "";
+        return;
+    }
+    t.textContent = txt;
+    // Fit in full text width
+    if (t.getComputedTextLength() < w)
+        return;
+    if (truncate_text_right) {
+        // Truncate the right side of the text.
+        for (var x = txt.length - 2; x > 0; x--) {
+            if (t.getSubStringLength(0, x + 2) <= w) {
+                t.textContent = txt.substring(0, x) + "..";
+                return;
+            }
+        }
+    } else {
+        // Truncate the left side of the text.
+        for (var x = 2; x < txt.length; x++) {
+            if (t.getSubStringLength(x - 2, txt.length) <= w) {
+                t.textContent = ".." + txt.substring(x, txt.length);
+                return;
+            }
+        }
+    }
+    t.textContent = "";
+}
+// zoom
+function zoom_reset(e) {
+    if (e.tagName == "rect") {
+        e.attributes.x.value = format_percent(100 * parseInt(e.attributes["fg:x"].value) / total_samples);
+        e.attributes.width.value = format_percent(100 * parseInt(e.attributes["fg:w"].value) / total_samples);
+    }
+    if (e.childNodes == undefined) return;
+    for(var i = 0, c = e.childNodes; i < c.length; i++) {
+        zoom_reset(c[i]);
+    }
+}
+function zoom_child(e, x, zoomed_width_samples) {
+    if (e.tagName == "text") {
+        var parent_x = parseFloat(find_child(e.parentNode, "rect[x]").attributes.x.value);
+        e.attributes.x.value = format_percent(parent_x + (100 * 3 / frames.attributes.width.value));
+    } else if (e.tagName == "rect") {
+        e.attributes.x.value = format_percent(100 * (parseInt(e.attributes["fg:x"].value) - x) / zoomed_width_samples);
+        e.attributes.width.value = format_percent(100 * parseInt(e.attributes["fg:w"].value) / zoomed_width_samples);
+    }
+    if (e.childNodes == undefined) return;
+    for(var i = 0, c = e.childNodes; i < c.length; i++) {
+        zoom_child(c[i], x, zoomed_width_samples);
+    }
+}
+function zoom_parent(e) {
+    if (e.attributes) {
+        if (e.attributes.x != undefined) {
+            e.attributes.x.value = "0.0%";
+        }
+        if (e.attributes.width != undefined) {
+            e.attributes.width.value = "100.0%";
+        }
+    }
+    if (e.childNodes == undefined) return;
+    for(var i = 0, c = e.childNodes; i < c.length; i++) {
+        zoom_parent(c[i]);
+    }
+}
+function zoom(node) {
+    var attr = find_child(node, "rect").attributes;
+    var width = parseInt(attr["fg:w"].value);
+    var xmin = parseInt(attr["fg:x"].value);
+    var xmax = xmin + width;
+    var ymin = parseFloat(attr.y.value);
+    unzoombtn.classList.remove("hide");
+    var el = frames.children;
+    var to_update_text = [];
+    for (var i = 0; i < el.length; i++) {
+        var e = el[i];
+        var a = find_child(e, "rect").attributes;
+        var ex = parseInt(a["fg:x"].value);
+        var ew = parseInt(a["fg:w"].value);
+        // Is it an ancestor
+        if (!inverted) {
+            var upstack = parseFloat(a.y.value) > ymin;
+        } else {
+            var upstack = parseFloat(a.y.value) < ymin;
+        }
+        if (upstack) {
+            // Direct ancestor
+            if (ex <= xmin && (ex+ew) >= xmax) {
+                e.classList.add("parent");
+                zoom_parent(e);
+                to_update_text.push(e);
+            }
+            // not in current path
+            else
+                e.classList.add("hide");
+        }
+        // Children maybe
+        else {
+            // no common path
+            if (ex < xmin || ex >= xmax) {
+                e.classList.add("hide");
+            }
+            else {
+                zoom_child(e, xmin, width);
+                to_update_text.push(e);
+            }
+        }
+    }
+    update_text_for_elements(to_update_text);
+}
+function unzoom() {
+    unzoombtn.classList.add("hide");
+    var el = frames.children;
+    for(var i = 0; i < el.length; i++) {
+        el[i].classList.remove("parent");
+        el[i].classList.remove("hide");
+        zoom_reset(el[i]);
+    }
+    update_text_for_elements(el);
+}
+// search
+function reset_search() {
+    var el = document.querySelectorAll("#frames rect");
+    for (var i = 0; i < el.length; i++) {
+        orig_load(el[i], "fill")
+    }
+    var params = get_params();
+    delete params.s;
+    history.replaceState(null, null, parse_params(params));
+}
+function search_prompt() {
+    if (!searching) {
+        var term = prompt("Enter a search term (regexp " +
+            "allowed, eg: ^ext4_)", "");
+        if (term != null) {
+            search(term)
+        }
+    } else {
+        reset_search();
+        searching = 0;
+        searchbtn.classList.remove("show");
+        searchbtn.firstChild.nodeValue = "Search"
+        matchedtxt.classList.add("hide");
+        matchedtxt.firstChild.nodeValue = ""
+    }
+}
+function search(term) {
+    var re = new RegExp(term);
+    var el = frames.children;
+    var matches = new Object();
+    var maxwidth = 0;
+    for (var i = 0; i < el.length; i++) {
+        var e = el[i];
+        // Skip over frames which are either not visible, or below the zoomed-to frame
+        if (e.classList.contains("hide") || e.classList.contains("parent")) {
+            continue;
+        }
+        var func = g_to_func(e);
+        var rect = find_child(e, "rect");
+        if (func == null || rect == null)
+            continue;
+        // Save max width. Only works as we have a root frame
+        var w = parseInt(rect.attributes["fg:w"].value);
+        if (w > maxwidth)
+            maxwidth = w;
+        if (func.match(re)) {
+            // highlight
+            var x = parseInt(rect.attributes["fg:x"].value);
+            orig_save(rect, "fill");
+            rect.attributes.fill.value = searchcolor;
+            // remember matches
+            if (matches[x] == undefined) {
+                matches[x] = w;
+            } else {
+                if (w > matches[x]) {
+                    // overwrite with parent
+                    matches[x] = w;
+                }
+            }
+            searching = 1;
+        }
+    }
+    if (!searching)
+        return;
+    var params = get_params();
+    params.s = term;
+    history.replaceState(null, null, parse_params(params));
+
+    searchbtn.classList.add("show");
+    searchbtn.firstChild.nodeValue = "Reset Search";
+    // calculate percent matched, excluding vertical overlap
+    var count = 0;
+    var lastx = -1;
+    var lastw = 0;
+    var keys = Array();
+    for (k in matches) {
+        if (matches.hasOwnProperty(k))
+            keys.push(k);
+    }
+    // sort the matched frames by their x location
+    // ascending, then width descending
+    keys.sort(function(a, b){
+        return a - b;
+    });
+    // Step through frames saving only the biggest bottom-up frames
+    // thanks to the sort order. This relies on the tree property
+    // where children are always smaller than their parents.
+    for (var k in keys) {
+        var x = parseInt(keys[k]);
+        var w = matches[keys[k]];
+        if (x >= lastx + lastw) {
+            count += w;
+            lastx = x;
+            lastw = w;
+        }
+    }
+    // display matched percent
+    matchedtxt.classList.remove("hide");
+    var pct = 100 * count / maxwidth;
+    if (pct != 100) pct = pct.toFixed(1);
+    matchedtxt.firstChild.nodeValue = "Matched: " + pct + "%";
+}
+function format_percent(n) {
+    return n.toFixed(4) + "%";
+}
+]]></script><rect x="0" y="0" width="100%" height="198" fill="url(#background)"/><text id="title" fill="rgb(0,0,0)" x="50.0000%" y="24.00">tracemoon - skynet (3.0s)</text><text id="details" fill="rgb(0,0,0)" x="10" y="181.00"> </text><text id="unzoom" class="hide" fill="rgb(0,0,0)" x="10" y="24.00">Reset Zoom</text><text id="search" fill="rgb(0,0,0)" x="1190" y="24.00">Search</text><text id="matched" fill="rgb(0,0,0)" x="1190" y="181.00"> </text><svg id="frames" x="10" width="1180" total_samples="2412"><g><title>[service::00000002] (289 samples, 11.98%)</title><rect x="0.0000%" y="133" width="11.9818%" height="15" fill="rgb(227,0,7)" fg:x="0" fg:w="289"/><text x="0.2500%" y="143.50">[service::00000002]</text></g><g><title>[service::00000006] (289 samples, 11.98%)</title><rect x="11.9818%" y="133" width="11.9818%" height="15" fill="rgb(217,0,24)" fg:x="289" fg:w="289"/><text x="12.2318%" y="143.50">[service::00000006]</text></g><g><title>[service::00000008] (289 samples, 11.98%)</title><rect x="23.9635%" y="133" width="11.9818%" height="15" fill="rgb(221,193,54)" fg:x="578" fg:w="289"/><text x="24.2135%" y="143.50">[service::00000008]</text></g><g><title>./../benchmark/cases/bench_bson.lua:29:skynet (6 samples, 0.25%)</title><rect x="35.9453%" y="101" width="0.2488%" height="15" fill="rgb(248,212,6)" fg:x="867" fg:w="6"/><text x="36.1953%" y="111.50"></text></g><g><title>[C]:lencode (6 samples, 0.25%)</title><rect x="35.9453%" y="85" width="0.2488%" height="15" fill="rgb(208,68,35)" fg:x="867" fg:w="6"/><text x="36.1953%" y="95.50"></text></g><g><title>[C]:encode_bson (5 samples, 0.21%)</title><rect x="35.9867%" y="69" width="0.2073%" height="15" fill="rgb(232,128,0)" fg:x="868" fg:w="5"/><text x="36.2367%" y="79.50"></text></g><g><title>[service::00000009] (15 samples, 0.62%)</title><rect x="35.9453%" y="133" width="0.6219%" height="15" fill="rgb(207,160,47)" fg:x="867" fg:w="15"/><text x="36.1953%" y="143.50"></text></g><g><title>./lualib/skynet.lua:402:f (15 samples, 0.62%)</title><rect x="35.9453%" y="117" width="0.6219%" height="15" fill="rgb(228,23,34)" fg:x="867" fg:w="15"/><text x="36.1953%" y="127.50"></text></g><g><title>./../benchmark/cases/bench_bson.lua:35:skynet (9 samples, 0.37%)</title><rect x="36.1940%" y="101" width="0.3731%" height="15" fill="rgb(218,30,26)" fg:x="873" fg:w="9"/><text x="36.4440%" y="111.50"></text></g><g><title>[C]:ldecode (9 samples, 0.37%)</title><rect x="36.1940%" y="85" width="0.3731%" height="15" fill="rgb(220,122,19)" fg:x="873" fg:w="9"/><text x="36.4440%" y="95.50"></text></g><g><title>./../benchmark/cases/bench_crypt.lua:27:skynet (4 samples, 0.17%)</title><rect x="36.6086%" y="101" width="0.1658%" height="15" fill="rgb(250,228,42)" fg:x="883" fg:w="4"/><text x="36.8586%" y="111.50"></text></g><g><title>[C]:ldesencode (4 samples, 0.17%)</title><rect x="36.6086%" y="85" width="0.1658%" height="15" fill="rgb(240,193,28)" fg:x="883" fg:w="4"/><text x="36.8586%" y="95.50"></text></g><g><title>./../benchmark/cases/bench_crypt.lua:33:skynet (5 samples, 0.21%)</title><rect x="36.7745%" y="101" width="0.2073%" height="15" fill="rgb(216,20,37)" fg:x="887" fg:w="5"/><text x="37.0245%" y="111.50"></text></g><g><title>[C]:ldesdecode (5 samples, 0.21%)</title><rect x="36.7745%" y="85" width="0.2073%" height="15" fill="rgb(206,188,39)" fg:x="887" fg:w="5"/><text x="37.0245%" y="95.50"></text></g><g><title>[service::0000000a] (13 samples, 0.54%)</title><rect x="36.5672%" y="133" width="0.5390%" height="15" fill="rgb(217,207,13)" fg:x="882" fg:w="13"/><text x="36.8172%" y="143.50"></text></g><g><title>./lualib/skynet.lua:402:f (13 samples, 0.54%)</title><rect x="36.5672%" y="117" width="0.5390%" height="15" fill="rgb(231,73,38)" fg:x="882" fg:w="13"/><text x="36.8172%" y="127.50"></text></g><g><title>[service::0000000b] (4 samples, 0.17%)</title><rect x="37.1061%" y="133" width="0.1658%" height="15" fill="rgb(225,20,46)" fg:x="895" fg:w="4"/><text x="37.3561%" y="143.50"></text></g><g><title>[service::0000000c] (260 samples, 10.78%)</title><rect x="37.2720%" y="133" width="10.7794%" height="15" fill="rgb(210,31,41)" fg:x="899" fg:w="260"/><text x="37.5220%" y="143.50">[service::000000..</text></g><g><title>./lualib/md5.lua:12:core (4 samples, 0.17%)</title><rect x="48.0929%" y="85" width="0.1658%" height="15" fill="rgb(221,200,47)" fg:x="1160" fg:w="4"/><text x="48.3429%" y="95.50"></text></g><g><title>[C]:str_gsub (3 samples, 0.12%)</title><rect x="48.1343%" y="69" width="0.1244%" height="15" fill="rgb(226,26,5)" fg:x="1161" fg:w="3"/><text x="48.3843%" y="79.50"></text></g><g><title>[C]:lmd5 (3 samples, 0.12%)</title><rect x="48.3416%" y="69" width="0.1244%" height="15" fill="rgb(249,33,26)" fg:x="1166" fg:w="3"/><text x="48.5916%" y="79.50"></text></g><g><title>./lualib/md5.lua:13 (3 samples, 0.12%)</title><rect x="49.2123%" y="53" width="0.1244%" height="15" fill="rgb(235,183,28)" fg:x="1187" fg:w="3"/><text x="49.4623%" y="63.50"></text></g><g><title>[C]:0x7d417c48cf50 (3 samples, 0.12%)</title><rect x="49.6683%" y="37" width="0.1244%" height="15" fill="rgb(221,5,38)" fg:x="1198" fg:w="3"/><text x="49.9183%" y="47.50"></text></g><g><title>./lualib/md5.lua:14 (20 samples, 0.83%)</title><rect x="49.3367%" y="53" width="0.8292%" height="15" fill="rgb(247,18,42)" fg:x="1190" fg:w="20"/><text x="49.5867%" y="63.50"></text></g><g><title>[C]:str_format (5 samples, 0.21%)</title><rect x="49.9585%" y="37" width="0.2073%" height="15" fill="rgb(241,131,45)" fg:x="1205" fg:w="5"/><text x="50.2085%" y="47.50"></text></g><g><title>?:[no proto] (4 samples, 0.17%)</title><rect x="50.1658%" y="53" width="0.1658%" height="15" fill="rgb(249,31,29)" fg:x="1210" fg:w="4"/><text x="50.4158%" y="63.50"></text></g><g><title>./../benchmark/cases/bench_md5.lua:22:skynet (64 samples, 2.65%)</title><rect x="48.0929%" y="101" width="2.6534%" height="15" fill="rgb(225,111,53)" fg:x="1160" fg:w="64"/><text x="48.3429%" y="111.50">./..</text></g><g><title>./lualib/md5.lua:13:core (60 samples, 2.49%)</title><rect x="48.2587%" y="85" width="2.4876%" height="15" fill="rgb(238,160,17)" fg:x="1164" fg:w="60"/><text x="48.5087%" y="95.50">./..</text></g><g><title>[C]:str_gsub (55 samples, 2.28%)</title><rect x="48.4660%" y="69" width="2.2803%" height="15" fill="rgb(214,148,48)" fg:x="1169" fg:w="55"/><text x="48.7160%" y="79.50">[..</text></g><g><title>[C]:str_format (5 samples, 0.21%)</title><rect x="50.5390%" y="53" width="0.2073%" height="15" fill="rgb(232,36,49)" fg:x="1219" fg:w="5"/><text x="50.7890%" y="63.50"></text></g><g><title>[C]:lmd5 (4 samples, 0.17%)</title><rect x="50.8706%" y="69" width="0.1658%" height="15" fill="rgb(209,103,24)" fg:x="1227" fg:w="4"/><text x="51.1206%" y="79.50"></text></g><g><title>./lualib/md5.lua:12:core (42 samples, 1.74%)</title><rect x="50.7463%" y="85" width="1.7413%" height="15" fill="rgb(229,88,8)" fg:x="1224" fg:w="42"/><text x="50.9963%" y="95.50"></text></g><g><title>[C]:str_gsub (35 samples, 1.45%)</title><rect x="51.0365%" y="69" width="1.4511%" height="15" fill="rgb(213,181,19)" fg:x="1231" fg:w="35"/><text x="51.2865%" y="79.50"></text></g><g><title>[C]:str_format (6 samples, 0.25%)</title><rect x="52.2388%" y="53" width="0.2488%" height="15" fill="rgb(254,191,54)" fg:x="1260" fg:w="6"/><text x="52.4888%" y="63.50"></text></g><g><title>./lualib/md5.lua:14 (3 samples, 0.12%)</title><rect x="53.4826%" y="53" width="0.1244%" height="15" fill="rgb(241,83,37)" fg:x="1290" fg:w="3"/><text x="53.7326%" y="63.50"></text></g><g><title>[C]:lmd5 (26 samples, 1.08%)</title><rect x="52.6119%" y="69" width="1.0779%" height="15" fill="rgb(233,36,39)" fg:x="1269" fg:w="26"/><text x="52.8619%" y="79.50"></text></g><g><title>[service::0000000d] (159 samples, 6.59%)</title><rect x="48.0514%" y="133" width="6.5920%" height="15" fill="rgb(226,3,54)" fg:x="1159" fg:w="159"/><text x="48.3014%" y="143.50">[service:..</text></g><g><title>./lualib/skynet.lua:402:f (159 samples, 6.59%)</title><rect x="48.0514%" y="117" width="6.5920%" height="15" fill="rgb(245,192,40)" fg:x="1159" fg:w="159"/><text x="48.3014%" y="127.50">./lualib/..</text></g><g><title>./../benchmark/cases/bench_md5.lua:28:skynet (94 samples, 3.90%)</title><rect x="50.7463%" y="101" width="3.8972%" height="15" fill="rgb(238,167,29)" fg:x="1224" fg:w="94"/><text x="50.9963%" y="111.50">./....</text></g><g><title>./lualib/md5.lua:13:core (52 samples, 2.16%)</title><rect x="52.4876%" y="85" width="2.1559%" height="15" fill="rgb(232,182,51)" fg:x="1266" fg:w="52"/><text x="52.7376%" y="95.50">...</text></g><g><title>[C]:str_gsub (23 samples, 0.95%)</title><rect x="53.6899%" y="69" width="0.9536%" height="15" fill="rgb(231,60,39)" fg:x="1295" fg:w="23"/><text x="53.9399%" y="79.50"></text></g><g><title>[C]:str_format (4 samples, 0.17%)</title><rect x="54.4776%" y="53" width="0.1658%" height="15" fill="rgb(208,69,12)" fg:x="1314" fg:w="4"/><text x="54.7276%" y="63.50"></text></g><g><title>[service::0000000e] (28 samples, 1.16%)</title><rect x="54.6434%" y="133" width="1.1609%" height="15" fill="rgb(235,93,37)" fg:x="1318" fg:w="28"/><text x="54.8934%" y="143.50"></text></g><g><title>./lualib/skynet.lua:964:pcall (4 samples, 0.17%)</title><rect x="59.3698%" y="117" width="0.1658%" height="15" fill="rgb(213,116,39)" fg:x="1432" fg:w="4"/><text x="59.6198%" y="127.50"></text></g><g><title>[C]:0xe (3 samples, 0.12%)</title><rect x="59.6186%" y="101" width="0.1244%" height="15" fill="rgb(222,207,29)" fg:x="1438" fg:w="3"/><text x="59.8686%" y="111.50"></text></g><g><title>[service::0000000f] (97 samples, 4.02%)</title><rect x="55.8043%" y="133" width="4.0216%" height="15" fill="rgb(206,96,30)" fg:x="1346" fg:w="97"/><text x="56.0543%" y="143.50">[ser..</text></g><g><title>./lualib/skynet.lua:988:pcall (7 samples, 0.29%)</title><rect x="59.5357%" y="117" width="0.2902%" height="15" fill="rgb(218,138,4)" fg:x="1436" fg:w="7"/><text x="59.7857%" y="127.50"></text></g><g><title>./../benchmark/cases/bench_seri.lua:26:skynet (10 samples, 0.41%)</title><rect x="59.8259%" y="101" width="0.4146%" height="15" fill="rgb(250,191,14)" fg:x="1443" fg:w="10"/><text x="60.0759%" y="111.50"></text></g><g><title>[C]:luaseri_pack (9 samples, 0.37%)</title><rect x="59.8673%" y="85" width="0.3731%" height="15" fill="rgb(239,60,40)" fg:x="1444" fg:w="9"/><text x="60.1173%" y="95.50"></text></g><g><title>./../benchmark/cases/bench_seri.lua:32:skynet (12 samples, 0.50%)</title><rect x="60.2405%" y="101" width="0.4975%" height="15" fill="rgb(206,27,48)" fg:x="1453" fg:w="12"/><text x="60.4905%" y="111.50"></text></g><g><title>[C]:luaseri_unpack (12 samples, 0.50%)</title><rect x="60.2405%" y="85" width="0.4975%" height="15" fill="rgb(225,35,8)" fg:x="1453" fg:w="12"/><text x="60.4905%" y="95.50"></text></g><g><title>[service::00000010] (23 samples, 0.95%)</title><rect x="59.8259%" y="133" width="0.9536%" height="15" fill="rgb(250,213,24)" fg:x="1443" fg:w="23"/><text x="60.0759%" y="143.50"></text></g><g><title>./lualib/skynet.lua:402:f (23 samples, 0.95%)</title><rect x="59.8259%" y="117" width="0.9536%" height="15" fill="rgb(247,123,22)" fg:x="1443" fg:w="23"/><text x="60.0759%" y="127.50"></text></g><g><title>./../benchmark/cases/bench_socket.lua:40:ITERATIONS_PER_CONN (8 samples, 0.33%)</title><rect x="61.2769%" y="101" width="0.3317%" height="15" fill="rgb(231,138,38)" fg:x="1478" fg:w="8"/><text x="61.5269%" y="111.50"></text></g><g><title>[C]:0x7d417c06d1c0 (8 samples, 0.33%)</title><rect x="61.2769%" y="85" width="0.3317%" height="15" fill="rgb(231,145,46)" fg:x="1478" fg:w="8"/><text x="61.5269%" y="95.50"></text></g><g><title>./lualib/skynet/socket.lua:329:socket_pool (3 samples, 0.12%)</title><rect x="61.6086%" y="85" width="0.1244%" height="15" fill="rgb(251,118,11)" fg:x="1486" fg:w="3"/><text x="61.8586%" y="95.50"></text></g><g><title>./lualib/skynet.lua:375:f (12 samples, 0.50%)</title><rect x="61.2769%" y="117" width="0.4975%" height="15" fill="rgb(217,147,25)" fg:x="1478" fg:w="12"/><text x="61.5269%" y="127.50"></text></g><g><title>./../benchmark/cases/bench_socket.lua:47:ITERATIONS_PER_CONN (4 samples, 0.17%)</title><rect x="61.6086%" y="101" width="0.1658%" height="15" fill="rgb(247,81,37)" fg:x="1486" fg:w="4"/><text x="61.8586%" y="111.50"></text></g><g><title>./lualib/skynet.lua:402:f (8 samples, 0.33%)</title><rect x="61.7745%" y="117" width="0.3317%" height="15" fill="rgb(209,12,38)" fg:x="1490" fg:w="8"/><text x="62.0245%" y="127.50"></text></g><g><title>./../benchmark/cases/bench_socket.lua:40:ITERATIONS_PER_CONN (8 samples, 0.33%)</title><rect x="61.7745%" y="101" width="0.3317%" height="15" fill="rgb(227,1,9)" fg:x="1490" fg:w="8"/><text x="62.0245%" y="111.50"></text></g><g><title>[C]:0x7d417c06d1c0 (8 samples, 0.33%)</title><rect x="61.7745%" y="85" width="0.3317%" height="15" fill="rgb(248,47,43)" fg:x="1490" fg:w="8"/><text x="62.0245%" y="95.50"></text></g><g><title>[service::00000019] (33 samples, 1.37%)</title><rect x="60.7794%" y="133" width="1.3682%" height="15" fill="rgb(221,10,30)" fg:x="1466" fg:w="33"/><text x="61.0294%" y="143.50"></text></g><g><title>./../benchmark/cases/bench_socket_service.lua:12:socket (5 samples, 0.21%)</title><rect x="62.3964%" y="69" width="0.2073%" height="15" fill="rgb(210,229,1)" fg:x="1505" fg:w="5"/><text x="62.6464%" y="79.50"></text></g><g><title>./../benchmark/cases/bench_socket_service.lua:15:socket (3 samples, 0.12%)</title><rect x="62.6451%" y="69" width="0.1244%" height="15" fill="rgb(222,148,37)" fg:x="1511" fg:w="3"/><text x="62.8951%" y="79.50"></text></g><g><title>[C]:0x7d4175ec5790 (5 samples, 0.21%)</title><rect x="63.1012%" y="53" width="0.2073%" height="15" fill="rgb(234,67,33)" fg:x="1522" fg:w="5"/><text x="63.3512%" y="63.50"></text></g><g><title>./lualib/skynet.lua:402:f (24 samples, 1.00%)</title><rect x="62.3964%" y="117" width="0.9950%" height="15" fill="rgb(247,98,35)" fg:x="1505" fg:w="24"/><text x="62.6464%" y="127.50"></text></g><g><title>./lualib/skynet/socket.lua:206:socket_message (24 samples, 1.00%)</title><rect x="62.3964%" y="101" width="0.9950%" height="15" fill="rgb(247,138,52)" fg:x="1505" fg:w="24"/><text x="62.6464%" y="111.50"></text></g><g><title>./lualib/skynet/socket.lua:145:socket_pool (24 samples, 1.00%)</title><rect x="62.3964%" y="85" width="0.9950%" height="15" fill="rgb(213,79,30)" fg:x="1505" fg:w="24"/><text x="62.6464%" y="95.50"></text></g><g><title>./../benchmark/cases/bench_socket_service.lua:18:socket (14 samples, 0.58%)</title><rect x="62.8109%" y="69" width="0.5804%" height="15" fill="rgb(246,177,23)" fg:x="1515" fg:w="14"/><text x="63.0609%" y="79.50"></text></g><g><title>[service::0000001a] (33 samples, 1.37%)</title><rect x="62.1476%" y="133" width="1.3682%" height="15" fill="rgb(230,62,27)" fg:x="1499" fg:w="33"/><text x="62.3976%" y="143.50"></text></g><g><title>./../benchmark/cases/bench_sproto.lua:36:skynet (4 samples, 0.17%)</title><rect x="63.5158%" y="101" width="0.1658%" height="15" fill="rgb(216,154,8)" fg:x="1532" fg:w="4"/><text x="63.7658%" y="111.50"></text></g><g><title>./lualib/sproto.lua:72:querytype (4 samples, 0.17%)</title><rect x="63.5158%" y="85" width="0.1658%" height="15" fill="rgb(244,35,45)" fg:x="1532" fg:w="4"/><text x="63.7658%" y="95.50"></text></g><g><title>./../benchmark/cases/bench_sproto.lua:42:skynet (8 samples, 0.33%)</title><rect x="63.6816%" y="101" width="0.3317%" height="15" fill="rgb(251,115,12)" fg:x="1536" fg:w="8"/><text x="63.9316%" y="111.50"></text></g><g><title>./lualib/sproto.lua:77:querytype (8 samples, 0.33%)</title><rect x="63.6816%" y="85" width="0.3317%" height="15" fill="rgb(240,54,50)" fg:x="1536" fg:w="8"/><text x="63.9316%" y="95.50"></text></g><g><title>[C]:ldecode (6 samples, 0.25%)</title><rect x="63.7645%" y="69" width="0.2488%" height="15" fill="rgb(233,84,52)" fg:x="1538" fg:w="6"/><text x="64.0145%" y="79.50"></text></g><g><title>[service::0000001b] (13 samples, 0.54%)</title><rect x="63.5158%" y="133" width="0.5390%" height="15" fill="rgb(207,117,47)" fg:x="1532" fg:w="13"/><text x="63.7658%" y="143.50"></text></g><g><title>./lualib/skynet.lua:402:f (13 samples, 0.54%)</title><rect x="63.5158%" y="117" width="0.5390%" height="15" fill="rgb(249,43,39)" fg:x="1532" fg:w="13"/><text x="63.7658%" y="127.50"></text></g><g><title>[service:cslave] (289 samples, 11.98%)</title><rect x="64.0547%" y="133" width="11.9818%" height="15" fill="rgb(209,38,44)" fg:x="1545" fg:w="289"/><text x="64.3047%" y="143.50">[service:cslave]</text></g><g><title>[service:launcher] (289 samples, 11.98%)</title><rect x="76.0365%" y="133" width="11.9818%" height="15" fill="rgb(236,212,23)" fg:x="1834" fg:w="289"/><text x="76.2865%" y="143.50">[service:launcher]</text></g><g><title>all (2,412 samples, 100%)</title><rect x="0.0000%" y="149" width="100.0000%" height="15" fill="rgb(242,79,21)" fg:x="0" fg:w="2412"/><text x="0.2500%" y="159.50"></text></g><g><title>[service:service] (289 samples, 11.98%)</title><rect x="88.0182%" y="133" width="11.9818%" height="15" fill="rgb(211,96,35)" fg:x="2123" fg:w="289"/><text x="88.2682%" y="143.50">[service:service]</text></g></svg></svg>
