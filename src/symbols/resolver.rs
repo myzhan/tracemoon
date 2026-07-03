@@ -2,43 +2,118 @@
 
 use crate::symbols::cache::SymbolCache;
 use log::debug;
-use object::{Object, ObjectSymbol, SymbolKind};
+use object::{Object, ObjectSegment, ObjectSymbol, SymbolKind};
 use remoteprocess::Pid;
 use std::collections::BTreeMap;
 use std::sync::Mutex;
+
+/// Resolve a named symbol to its runtime address in a target process.
+///
+/// Scans each mapped binary for `symbol_name`, then applies the PIE load bias
+/// (mapping base minus the file's lowest loadable vaddr) to translate the
+/// linked vaddr into a runtime address.
+pub fn resolve_symbol_address(pid: Pid, symbol_name: &str) -> Option<usize> {
+    let maps = proc_maps::get_process_maps(pid as proc_maps::Pid).ok()?;
+
+    // Lowest mapped start address per backing file (the load base).
+    let mut file_base: BTreeMap<String, usize> = BTreeMap::new();
+    for map in &maps {
+        if let Some(path) = map.filename() {
+            let key = path.to_string_lossy().to_string();
+            let start = map.start();
+            file_base
+                .entry(key)
+                .and_modify(|b| {
+                    if start < *b {
+                        *b = start;
+                    }
+                })
+                .or_insert(start);
+        }
+    }
+
+    for (path, &base) in &file_base {
+        let data = match std::fs::read(path) {
+            Ok(d) => d,
+            Err(_) => continue,
+        };
+        let file = match object::File::parse(&*data) {
+            Ok(f) => f,
+            Err(_) => continue,
+        };
+
+        let sym_vaddr = file
+            .symbols()
+            .chain(file.dynamic_symbols())
+            .find(|s| s.name().map(|n| n == symbol_name).unwrap_or(false))
+            .map(|s| s.address());
+
+        let sym_vaddr = match sym_vaddr {
+            Some(v) if v != 0 => v,
+            _ => continue,
+        };
+
+        // Lowest loadable segment vaddr = the file's link base (0 for PIE).
+        let min_vaddr = file
+            .segments()
+            .map(|s| s.address())
+            .min()
+            .unwrap_or(0);
+
+        let bias = base as u64 - min_vaddr;
+        let runtime = (sym_vaddr + bias) as usize;
+        debug!(
+            "Resolved symbol {} @ vaddr 0x{:x} -> runtime 0x{:x} (base 0x{:x}, min_vaddr 0x{:x}) in {}",
+            symbol_name, sym_vaddr, runtime, base, min_vaddr, path
+        );
+        return Some(runtime);
+    }
+
+    None
+}
 
 /// Parsed symbols from a single binary/library
 struct BinarySymbols {
     /// Sorted by address for efficient lookup: (address, name)
     symbols: Vec<(u64, String)>,
+    /// Lowest loadable segment vaddr (the file's link base; 0 for PIE).
+    min_vaddr: u64,
 }
 
 impl BinarySymbols {
     fn from_file(path: &str) -> Option<Self> {
         let data = std::fs::read(path).ok()?;
         let file = object::File::parse(&*data).ok()?;
-        
+
         let mut symbols: Vec<(u64, String)> = file
             .symbols()
             .chain(file.dynamic_symbols())
-            .filter(|s| s.kind() == SymbolKind::Text)
+            // Only defined text symbols. Undefined imports (e.g. `getenv@GLIBC_2.2.5`)
+            // have address 0 and would otherwise catch any too-small offset lookup.
+            .filter(|s| s.kind() == SymbolKind::Text && !s.is_undefined())
             .filter_map(|s| {
+                let addr = s.address();
+                if addr == 0 {
+                    return None;
+                }
                 let name = s.name().ok()?;
                 if name.is_empty() {
                     return None;
                 }
                 // Strip leading underscore on macOS
                 let name = name.strip_prefix('_').unwrap_or(name);
-                Some((s.address(), name.to_string()))
+                Some((addr, name.to_string()))
             })
             .collect();
-        
+
         symbols.sort_by_key(|&(addr, _)| addr);
         symbols.dedup_by_key(|s| s.0);
-        
+
+        let min_vaddr = file.segments().map(|s| s.address()).min().unwrap_or(0);
+
         debug!("Loaded {} symbols from {}", symbols.len(), path);
-        
-        Some(Self { symbols })
+
+        Some(Self { symbols, min_vaddr })
     }
     
     /// Find the symbol containing the given offset
@@ -95,63 +170,55 @@ impl SymbolResolver {
     /// Look up symbol using proc-maps and binary symbol tables
     fn lookup_symbol(&self, addr: usize) -> Option<String> {
         let maps = proc_maps::get_process_maps(self.pid as proc_maps::Pid).ok()?;
-        
-        // Find the base address of the mapping containing this address
-        // On macOS, we need the start of the first mapping for the binary
-        let mut containing_map = None;
+
+        // Identify the backing file for this address, and that file's load base
+        // (the LOWEST mapping start for the file — a file spans several segment
+        // mappings, and only the first corresponds to the ELF link base).
         let mut binary_path = None;
-        
         for map in &maps {
             let start = map.start();
             let end = start + map.size();
-            
             if addr >= start && addr < end {
                 if let Some(path) = map.filename() {
                     binary_path = Some(path.to_string_lossy().to_string());
-                    containing_map = Some(start);
                     break;
                 }
             }
         }
-        
         let path = binary_path?;
-        let map_start = containing_map?;
-        let offset = addr - map_start;
-        
+
+        let load_base = maps
+            .iter()
+            .filter(|m| {
+                m.filename()
+                    .map(|p| p.to_string_lossy() == path.as_str())
+                    .unwrap_or(false)
+            })
+            .map(|m| m.start())
+            .min()?;
+
         // Extract filename for display
-        let filename = path
-            .rsplit('/')
-            .next()
-            .unwrap_or(&path)
-            .to_string();
-        
+        let filename = path.rsplit('/').next().unwrap_or(&path).to_string();
+
         // Try to resolve the actual function name from the symbol table
         let mut binary_cache = self.binary_symbols.lock().unwrap();
         let symbols = binary_cache
             .entry(path.clone())
             .or_insert_with(|| BinarySymbols::from_file(&path));
-        
+
         if let Some(ref syms) = symbols {
-            // On macOS, the offset in the file often matches virtual address directly
-            // Try with the raw offset first, then with typical macOS base addresses
-            if let Some(name) = syms.lookup(offset as u64) {
-                return Some(name.to_string());
-            }
-            
-            // Try with typical Mach-O text segment base (0x100000000 for main binary)
-            let macho_addr = 0x100000000u64 + offset as u64;
-            if let Some(name) = syms.lookup(macho_addr) {
-                return Some(name.to_string());
-            }
-            
-            // Try raw address
-            if let Some(name) = syms.lookup(addr as u64) {
+            // Translate the runtime address back to a file vaddr:
+            //   vaddr = addr - load_base + min_vaddr
+            let file_vaddr = (addr as u64)
+                .wrapping_sub(load_base as u64)
+                .wrapping_add(syms.min_vaddr);
+            if let Some(name) = syms.lookup(file_vaddr) {
                 return Some(name.to_string());
             }
         }
-        
-        // Fallback: return filename+offset
-        Some(format!("{}+0x{:x}", filename, offset))
+
+        // Fallback: return filename + file offset
+        Some(format!("{}+0x{:x}", filename, addr - load_base))
     }
 
     /// Resolve multiple addresses efficiently

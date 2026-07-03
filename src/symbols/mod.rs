@@ -1,4 +1,4 @@
 pub mod cache;
 pub mod resolver;
 
-pub use resolver::SymbolResolver;
+pub use resolver::{resolve_symbol_address, SymbolResolver};

@@ -33,7 +33,7 @@ pub enum TracemoonError {
     #[error("Target process exited during profiling")]
     ProcessExited,
 
-    #[error("Invalid Lua version: expected 5.4, found {found}")]
+    #[error("Unsupported Lua version: expected 5.4 or 5.5, found {found}")]
     UnsupportedLuaVersion { found: String },
 
     #[error("I/O error: {0}")]

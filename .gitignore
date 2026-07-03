@@ -1,6 +1,9 @@
 /target
 Cargo.lock
 
+# Local linker-symlink workaround for missing -dev packages
+/.linkdeps
+
 # Profiler output
 *.svg
 *.txt

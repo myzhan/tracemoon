@@ -4,6 +4,8 @@ use clap::{crate_name, crate_version, Arg, Command};
 use log::info;
 use remoteprocess::Pid;
 
+use crate::lua::LuaVersion;
+
 /// Default sample rate in Hz
 pub const DEFAULT_SAMPLE_RATE: u32 = 100;
 
@@ -23,6 +25,12 @@ pub struct Config {
     
     /// Output file path (None = stdout)
     pub output_file: Option<String>,
+
+    /// Force a Lua version/layout (None = auto-detect).
+    pub lua_version: Option<LuaVersion>,
+
+    /// Command to spawn and profile (after `--`). Mutually exclusive with `pid`.
+    pub command: Option<Vec<String>>,
 }
 
 impl Default for Config {
@@ -32,6 +40,8 @@ impl Default for Config {
             sample_rate: DEFAULT_SAMPLE_RATE,
             duration: DEFAULT_DURATION,
             output_file: None,
+            lua_version: None,
+            command: None,
         }
     }
 }
@@ -49,8 +59,7 @@ impl Config {
             .short('p')
             .long("pid")
             .value_name("PID")
-            .help("PID of a running Lua process")
-            .required(true)
+            .help("Attach to a running Lua process by PID (mutually exclusive with -- <cmd>)")
             .takes_value(true);
 
         let rate_arg = Arg::new("rate")
@@ -77,16 +86,31 @@ impl Config {
             .default_value("flamegraph.svg")
             .takes_value(true);
 
+        let lua_version_arg = Arg::new("lua-version")
+            .long("lua-version")
+            .value_name("VERSION")
+            .help("Force the Lua version layout (5.4 or 5.5). Default: auto-detect")
+            .takes_value(true);
+
+        let command_arg = Arg::new("command")
+            .value_name("COMMAND")
+            .help("Command to spawn and profile (after --). Mutually exclusive with -p")
+            .last(true)
+            .multiple_values(true)
+            .takes_value(true);
+
         let record_cmd = Command::new("record")
             .about("Record a Lua profile")
             .arg(pid_arg)
             .arg(rate_arg)
             .arg(duration_arg)
-            .arg(output_arg);
+            .arg(output_arg)
+            .arg(lua_version_arg)
+            .arg(command_arg);
 
         let app = Command::new(crate_name!())
             .version(crate_version!())
-            .about("A sampling profiler for Lua 5.4")
+            .about("A sampling profiler for Lua (5.4 / 5.5, incl. skynet multi-VM)")
             .subcommand_required(true)
             .subcommand(record_cmd);
 
@@ -124,6 +148,25 @@ impl Config {
 
             // Parse output file
             config.output_file = sub_matches.value_of("output").map(String::from);
+
+            // Parse optional Lua version override
+            if let Some(v) = sub_matches.value_of("lua-version") {
+                let parsed = v.parse().map_err(|_| {
+                    clap::Error::raw(
+                        clap::ErrorKind::InvalidValue,
+                        format!("Invalid --lua-version '{}': expected 5.4 or 5.5\n", v),
+                    )
+                })?;
+                config.lua_version = Some(parsed);
+            }
+
+            // Parse trailing spawn command (after `--`)
+            if let Some(values) = sub_matches.values_of("command") {
+                let argv: Vec<String> = values.map(String::from).collect();
+                if !argv.is_empty() {
+                    config.command = Some(argv);
+                }
+            }
         }
 
         info!("Configuration: {:?}", config);
@@ -180,5 +223,45 @@ mod tests {
         assert_eq!(config.sample_rate, DEFAULT_SAMPLE_RATE);
         assert_eq!(config.duration, DEFAULT_DURATION);
         assert_eq!(config.output_file, Some("flamegraph.svg".to_string()));
+    }
+
+    #[test]
+    fn test_parse_spawn_command() {
+        let args = vec![
+            "tracemoon".to_string(),
+            "record".to_string(),
+            "-d".to_string(),
+            "5".to_string(),
+            "--".to_string(),
+            "./foo".to_string(),
+            "bar".to_string(),
+            "baz".to_string(),
+        ];
+
+        let config = Config::from_args(&args).unwrap();
+        assert_eq!(config.pid, None);
+        assert_eq!(config.duration, 5);
+        assert_eq!(
+            config.command,
+            Some(vec![
+                "./foo".to_string(),
+                "bar".to_string(),
+                "baz".to_string()
+            ])
+        );
+    }
+
+    #[test]
+    fn test_parse_attach_has_no_command() {
+        let args = vec![
+            "tracemoon".to_string(),
+            "record".to_string(),
+            "-p".to_string(),
+            "5".to_string(),
+        ];
+
+        let config = Config::from_args(&args).unwrap();
+        assert_eq!(config.pid, Some(5));
+        assert_eq!(config.command, None);
     }
 }

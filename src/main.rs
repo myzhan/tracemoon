@@ -1,7 +1,8 @@
-//! tracemoon - A sampling profiler for Lua 5.4
+//! tracemoon - A sampling profiler for Lua (5.4 / 5.5)
 //!
 //! Similar to py-spy, tracemoon attaches to a running Lua process and
-//! samples the call stack periodically to generate a profile.
+//! samples the call stack periodically to generate a profile. It supports
+//! plain single-VM Lua as well as skynet processes hosting many Lua VMs.
 
 #[macro_use]
 extern crate log;
@@ -18,7 +19,7 @@ use std::process::ExitCode;
 
 use config::Config;
 use error::TracemoonError;
-use sampler::run_profiler;
+use sampler::{run_profiler, run_profiler_spawn};
 
 fn check_permissions() {
     #[cfg(target_os = "macos")]
@@ -49,14 +50,25 @@ fn check_permissions() {
 fn run() -> Result<(), TracemoonError> {
     let config = Config::from_commandline();
 
-    match config.pid {
-        Some(pid) => {
+    match (config.pid, config.command.clone()) {
+        (Some(_), Some(_)) => {
+            return Err(TracemoonError::Config(
+                "Specify either -p <PID> to attach or a command after -- to spawn, not both."
+                    .to_string(),
+            ));
+        }
+        (Some(pid), None) => {
             info!("Starting profiler for PID {}", pid);
             run_profiler(pid, config)?;
         }
-        None => {
+        (None, Some(argv)) => {
+            info!("Spawning and profiling: {}", argv.join(" "));
+            run_profiler_spawn(argv, config)?;
+        }
+        (None, None) => {
             return Err(TracemoonError::Config(
-                "No PID specified. Use -p <PID> to specify the target process.".to_string(),
+                "No target specified. Use -p <PID> to attach, or -- <command> to spawn."
+                    .to_string(),
             ));
         }
     }
@@ -99,7 +111,7 @@ fn main() -> ExitCode {
             eprintln!("Possible causes:");
             eprintln!("  - The process is not running Lua");
             eprintln!("  - Lua is not currently active (no Lua code running)");
-            eprintln!("  - The Lua version is not supported (only Lua 5.4 is supported)");
+            eprintln!("  - The Lua version is not supported (only Lua 5.4 / 5.5 are supported)");
             eprintln!("  - Debug symbols are stripped and lua_State cannot be located");
             ExitCode::from(3)
         }
