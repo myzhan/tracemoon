@@ -9,12 +9,12 @@ use std::time::{Duration, Instant};
 use log::{debug, info, warn};
 use remoteprocess::Pid;
 
-use crate::config::Config;
+use crate::config::{Config, RunMode};
 use crate::error::{Result, TracemoonError};
 use crate::lua::{LuaLayout, LuaVersion, StackFrame, StackWalker};
 use crate::output::{Aggregator, CollapsedOutput};
 use crate::process::{
-    create_reader, detect_lua_version, get_native_frames, LuaStateDiscovery, ProcessMemoryReader,
+    create_reader, detect_lua_version, LuaStateDiscovery, NativeUnwinder, ProcessMemoryReader,
     SkynetDiscovery, SpawnedChild,
 };
 use crate::symbols::SymbolResolver;
@@ -52,6 +52,9 @@ pub struct Sampler {
     reader: Box<dyn ProcessMemoryReader>,
     layout: LuaLayout,
     mode: Mode,
+    /// Native C-stack unwinder (single-VM mode only; `None` in skynet mode or on
+    /// unsupported platforms). Reused across ticks to avoid rebuilding the unwind state.
+    native_unwinder: Option<NativeUnwinder>,
     symbol_resolver: SymbolResolver,
     aggregator: Aggregator,
     running: Arc<AtomicBool>,
@@ -89,6 +92,13 @@ impl Sampler {
             Mode::Single { addr: Cell::new(0) }
         };
 
+        // Native C-stack unwinder is meaningful only for a single VM: a ptrace register
+        // snapshot maps to one worker thread, not to a specific skynet service.
+        let native_unwinder = match &mode {
+            Mode::Single { .. } => NativeUnwinder::new(pid),
+            Mode::Skynet { .. } => None,
+        };
+
         // Create symbol resolver
         let symbol_resolver = SymbolResolver::new(pid);
         symbol_resolver.preload();
@@ -99,6 +109,7 @@ impl Sampler {
             reader,
             layout,
             mode,
+            native_unwinder,
             symbol_resolver,
             aggregator: Aggregator::new(),
             running: Arc::new(AtomicBool::new(true)),
@@ -143,6 +154,10 @@ impl Sampler {
 
         let mut consecutive_failures = 0;
         const MAX_CONSECUTIVE_FAILURES: u32 = 10;
+
+        // Live `top` view refreshes on this cadence.
+        let render_interval = Duration::from_secs(1);
+        let mut last_render = Instant::now() - render_interval;
 
         while self.running.load(Ordering::Relaxed) {
             let sample_start = Instant::now();
@@ -194,6 +209,12 @@ impl Sampler {
                 }
             }
 
+            // Live `top` rendering.
+            if self.config.mode == RunMode::Top && last_render.elapsed() >= render_interval {
+                self.render_top();
+                last_render = Instant::now();
+            }
+
             // Sleep until next sample
             let elapsed = sample_start.elapsed();
             if elapsed < sample_interval {
@@ -203,6 +224,48 @@ impl Sampler {
 
         info!("Sampling complete");
         Ok(())
+    }
+
+    /// Clear the terminal and redraw the live top-functions view.
+    fn render_top(&self) {
+        use std::io::Write;
+        let screen = crate::output::top::render(
+            &self.aggregator,
+            &self.target_label(),
+            self.start_time.elapsed().as_secs_f64(),
+            30,
+        );
+        let stdout = std::io::stdout();
+        let mut handle = stdout.lock();
+        // \x1b[2J clears the screen, \x1b[H moves the cursor home.
+        let _ = write!(handle, "\x1b[2J\x1b[H{}", screen);
+        let _ = handle.flush();
+    }
+
+    /// Take a single snapshot of the current stack(s) (for `dump`).
+    pub fn capture_stacks(&self) -> Result<Vec<Vec<StackFrame>>> {
+        self.sample()
+    }
+
+    /// Human-readable target label for output headers/titles.
+    fn target_label(&self) -> String {
+        match &self.target {
+            Target::Spawn(_) => self
+                .config
+                .command
+                .as_ref()
+                .and_then(|argv| argv.first())
+                .map(|c| c.rsplit('/').next().unwrap_or(c.as_str()).to_string())
+                .unwrap_or_else(|| format!("PID {}", self.pid())),
+            Target::Attach(pid) => format!("PID {}", pid),
+        }
+    }
+
+    /// Terminate the spawned child, if any. No-op in attach mode.
+    fn terminate_child(&self) {
+        if let Target::Spawn(child) = &self.target {
+            child.terminate();
+        }
     }
 
     /// Take a single sample, returning zero or more stacks to aggregate.
@@ -253,8 +316,12 @@ impl Sampler {
             }
         }
 
-        // Get native (C) stack frames
-        let native_frames = get_native_frames(self.pid(), self.reader.as_ref()).unwrap_or_default();
+        // Get native (C) stack frames from the reusable unwinder (best-effort).
+        let native_frames = self
+            .native_unwinder
+            .as_ref()
+            .map(|u| u.frames(self.reader.as_ref()))
+            .unwrap_or_default();
         let native_stack_frames: Vec<StackFrame> = native_frames
             .iter()
             .map(|nf| {
@@ -266,16 +333,21 @@ impl Sampler {
             })
             .collect();
 
-        // Merge: native frames at bottom, Lua frames on top.
+        // Merge into one deepest-first stack (current frame at index 0, as the aggregator
+        // expects): the Lua frames sit on top, the native C interpreter chain
+        // (luaV_execute → … → main → _libc_start_main) below. Both sources are already
+        // innermost-first, so we append the native chain after the Lua frames without
+        // reversing. Unnamed C frames are dropped when a native chain is present to avoid
+        // duplicating the interpreter's own C frames that also show up on the Lua CallInfo.
         let mut merged = Vec::new();
-        for frame in native_stack_frames.iter().rev() {
-            if frame.name.is_empty() && !merged.is_empty() {
-                continue;
-            }
-            merged.push(frame.clone());
-        }
         for frame in lua_frames {
             if frame.is_c && frame.name.is_empty() && !native_stack_frames.is_empty() {
+                continue;
+            }
+            merged.push(frame);
+        }
+        for frame in native_stack_frames {
+            if frame.name.is_empty() {
                 continue;
             }
             merged.push(frame);
@@ -329,22 +401,7 @@ impl Sampler {
         let output_path = self.config.output_file.as_deref().unwrap_or("profile.txt");
 
         if output_path.ends_with(".svg") {
-            let label = match &self.target {
-                Target::Spawn(_) => self
-                    .config
-                    .command
-                    .as_ref()
-                    .and_then(|argv| argv.first())
-                    .map(|c| {
-                        c.rsplit('/')
-                            .next()
-                            .unwrap_or(c.as_str())
-                            .to_string()
-                    })
-                    .unwrap_or_else(|| format!("PID {}", self.pid())),
-                Target::Attach(pid) => format!("PID {}", pid),
-            };
-            let title = format!("tracemoon - {} ({:.1}s)", label, duration);
+            let title = format!("tracemoon - {} ({:.1}s)", self.target_label(), duration);
             output
                 .write_flamegraph_file(output_path, &title)
                 .map_err(TracemoonError::Io)?;
@@ -405,6 +462,90 @@ pub fn run_profiler_spawn(argv: Vec<String>, mut config: Config) -> Result<()> {
 
     // Generate output
     sampler.generate_output()?;
+
+    Ok(())
+}
+
+/// Build a sampler for either an attach PID or a spawned command.
+fn build_target(pid: Option<Pid>, argv: Option<Vec<String>>) -> Result<(Target, Option<Vec<String>>)> {
+    match (pid, argv) {
+        (Some(pid), None) => Ok((Target::Attach(pid), None)),
+        (None, Some(argv)) => {
+            let child = SpawnedChild::spawn(&argv)?;
+            Ok((Target::Spawn(child), Some(argv)))
+        }
+        (Some(_), Some(_)) => Err(TracemoonError::Config(
+            "Specify either -p <PID> to attach or a command after -- to spawn, not both."
+                .to_string(),
+        )),
+        (None, None) => Err(TracemoonError::Config(
+            "No target specified. Use -p <PID> to attach, or -- <command> to spawn.".to_string(),
+        )),
+    }
+}
+
+/// Print a one-shot snapshot of the current stack(s) and exit (`dump` mode).
+pub fn run_dump(pid: Option<Pid>, argv: Option<Vec<String>>, mut config: Config) -> Result<()> {
+    let (target, spawned_argv) = build_target(pid, argv)?;
+    if let Some(argv) = spawned_argv {
+        config.command = Some(argv);
+    }
+
+    let sampler = Sampler::new(target, config)?;
+
+    // For a spawned child, let it run so it has a stack to snapshot.
+    if let Target::Spawn(child) = &sampler.target {
+        child.resume()?;
+    }
+
+    // Retry until we get a non-empty snapshot or the deadline passes (spawned VMs and lazy
+    // single-VM discovery may need a few ticks to warm up).
+    let deadline = Instant::now() + Duration::from_millis(1500);
+    let mut stacks = Vec::new();
+    loop {
+        if let Ok(s) = sampler.capture_stacks() {
+            if !s.is_empty() {
+                stacks = s;
+                break;
+            }
+        }
+        if Instant::now() >= deadline {
+            break;
+        }
+        if let Target::Spawn(child) = &sampler.target {
+            if child.has_exited() {
+                break;
+            }
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+
+    sampler.terminate_child();
+
+    let out = crate::output::dump::format(&stacks, &sampler.target_label(), sampler.pid());
+    print!("{}", out);
+
+    Ok(())
+}
+
+/// Live-updating terminal view of the hottest functions (`top` mode).
+pub fn run_top(pid: Option<Pid>, argv: Option<Vec<String>>, mut config: Config) -> Result<()> {
+    let (target, spawned_argv) = build_target(pid, argv)?;
+    if let Some(argv) = spawned_argv {
+        config.command = Some(argv);
+    }
+
+    let mut sampler = Sampler::new(target, config)?;
+
+    let running = sampler.get_stop_handle();
+    ctrlc_setup(running)?;
+
+    // run() drives the live rendering for Top mode; resumes/stops the child as needed.
+    let run_result = sampler.run();
+
+    sampler.terminate_child();
+
+    run_result?;
 
     Ok(())
 }

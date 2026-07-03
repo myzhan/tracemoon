@@ -12,7 +12,7 @@ pub mod macos;
 
 pub use discovery::{detect_lua_version, LuaStateDiscovery};
 pub use reader::{ProcessMemoryReader, read_struct, read_pointer, read_string};
-pub use native_stack::NativeFrame;
+pub use native_stack::NativeUnwinder;
 pub use skynet::SkynetDiscovery;
 pub use spawn::SpawnedChild;
 
@@ -25,34 +25,16 @@ pub fn create_reader(pid: Pid) -> Result<Box<dyn ProcessMemoryReader>> {
     {
         Ok(Box::new(linux::LinuxMemoryReader::new(pid)?))
     }
-    
+
     #[cfg(target_os = "macos")]
     {
         Ok(Box::new(macos::MacOSMemoryReader::new(pid)?))
     }
-    
+
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
         Err(crate::error::TracemoonError::Other(
             "Unsupported platform".to_string()
         ))
-    }
-}
-
-/// Get native stack frames for a process
-pub fn get_native_frames(pid: Pid, reader: &dyn ProcessMemoryReader) -> Result<Vec<NativeFrame>> {
-    #[cfg(target_os = "macos")]
-    {
-        native_stack::macos::get_native_frames(nix::unistd::Pid::from_raw(pid), reader)
-    }
-    
-    #[cfg(target_os = "linux")]
-    {
-        native_stack::linux::get_native_frames(nix::unistd::Pid::from_raw(pid), reader)
-    }
-    
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-    {
-        Ok(Vec::new())
     }
 }

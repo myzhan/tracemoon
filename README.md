@@ -7,7 +7,8 @@ A sampling profiler for Lua 5.4 and 5.5, inspired by [py-spy](https://github.com
 - **Zero instrumentation** - attaches to running Lua processes without modification
 - **Multiple Lua versions** - supports Lua 5.4 and 5.5, auto-detected (or forced with `--lua-version`)
 - **skynet multi-VM** - enumerates every service's Lua VM and renders each under a `[service:name]` root frame
-- **Mixed stacks** - captures both Lua and native C call stacks, merged together (single-VM mode)
+- **Mixed stacks** - captures both Lua and native C call stacks, merged together (single-VM mode). On Linux x86_64 the native chain (`luaV_execute → … → main`) is unwound via libunwind; in spawn mode this works without root
+- **Three output modes** - `record` (flamegraph/collapsed file), `dump` (one-shot stack snapshot), and `top` (live hottest-functions view), à la py-spy
 - **Symbol resolution** - resolves C function names from Mach-O/ELF symbol tables
 - **Lua debug info** - extracts source files, line numbers, and function names
 - **Flamegraph SVG** - generates interactive flamegraphs directly (via [inferno](https://github.com/jonhoo/inferno))
@@ -32,17 +33,24 @@ open flamegraph.svg
 ## Usage
 
 ```
-tracemoon record [OPTIONS] [-- <COMMAND>...]
+tracemoon <SUBCOMMAND> [OPTIONS] [-- <COMMAND>...]
 
-OPTIONS:
+SUBCOMMANDS:
+  record   Record a profile to a flamegraph / collapsed file
+  dump     Print a one-shot snapshot of the current stack(s) and exit
+  top      Live-updating terminal view of the hottest functions
+
+OPTIONS (record / top):
   -p, --pid <PID>          Attach to a running Lua process by PID
   -r, --rate <HZ>          Sample rate in Hz (default: 100)
   -d, --duration <SECS>    Duration in seconds (0 = until Ctrl+C, default: 0)
-  -o, --output <FILE>      Output file (default: flamegraph.svg)
+  -o, --output <FILE>      Output file, record only (default: flamegraph.svg)
       --lua-version <VER>  Force the Lua layout: 5.4 or 5.5 (default: auto-detect)
+
+`dump` takes only -p / --lua-version / -- <command> (no rate, duration, or output).
 ```
 
-tracemoon has two modes; specify exactly one target:
+Every subcommand accepts the same two target modes; specify exactly one target:
 
 - **Attach** (`-p <PID>`): profile a process that is already running. Anything that
   happened before you attach is not captured.
@@ -80,7 +88,19 @@ sudo tracemoon record -d 5 -o out.svg -- lua tests/lua/multi_func.lua
 
 # Spawn a skynet benchmark and capture it from process start
 sudo tracemoon record -d 10 -o skynet.svg -- ./skynet ../benchmark/config
+
+# One-shot snapshot of the current stack(s), printed to stdout
+tracemoon dump -- lua tests/lua/multi_func.lua
+sudo tracemoon dump -p 12345
+
+# Live "top functions" view (%Own = leaf time, %Total = anywhere in stack)
+tracemoon top -- lua tests/lua/multi_func.lua
+sudo tracemoon top -p 12345 -r 200
 ```
+
+Because spawn mode makes tracemoon the target's parent, ptrace seize is permitted even under
+`kernel.yama.ptrace_scope=1` — so native C stacks (and `dump`/`top`) work **without root** when
+you spawn the target. Attaching to an existing PID still needs root / `CAP_SYS_PTRACE`.
 
 ## Sample Output
 
@@ -122,7 +142,8 @@ Sampling statistics:
    - skynet: walk the `H` (`handle_storage`) global → service slots → `snlua.activeL`, one VM per service
 4. **Sample** at configurable frequency (default 100 Hz):
    - Walk each VM's Lua `CallInfo` chain for Lua-level stacks
-   - Single-VM mode also walks native frame pointers for C-level stacks and merges them
+   - Single-VM mode also unwinds the native C stack (libunwind-ptrace on Linux x86_64, frame
+     pointers via `task_for_pid` on macOS) and merges it beneath the Lua frames
    - skynet mode prepends a `[service:name]` root frame per VM (native merge is skipped, since a
      ptrace register snapshot maps to one worker thread, not a specific VM)
 5. **Resolve** symbols:

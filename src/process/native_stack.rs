@@ -1,7 +1,18 @@
-//! Native (C) stack walking for process introspection
+//! Native (C) stack walking for process introspection.
+//!
+//! On Linux x86_64 the native stack is unwound via `remoteprocess`'s libunwind-ptrace
+//! backend: [`NativeUnwinder`] holds a reusable libunwind address space, and each call to
+//! [`NativeUnwinder::frames`] seizes+interrupts the target's main thread (via
+//! `remoteprocess::Thread::lock`), walks the unwind cursor, then detaches. This works in
+//! spawn mode without root — we are the child's parent, so ptrace seize is permitted even
+//! under `kernel.yama.ptrace_scope=1`.
+//!
+//! On macOS the frame-pointer walker below (`NativeStackWalker` + `macos::get_native_frames`)
+//! is used via `task_for_pid`. On unsupported platforms native stacks are empty.
 
 use crate::error::Result;
 use crate::process::ProcessMemoryReader;
+use remoteprocess::Pid;
 
 /// A native stack frame
 #[derive(Debug, Clone)]
@@ -12,7 +23,121 @@ pub struct NativeFrame {
     pub fp: usize,
 }
 
-/// Native stack walker - captures C-level call stacks
+/// Reusable native-stack unwinder for one target process.
+///
+/// Created once per sampler (single-VM mode only) and reused every tick so the libunwind
+/// address space isn't rebuilt at the sample rate. `new` returns `None` on platforms where
+/// native unwinding isn't supported, in which case the native merge is simply skipped.
+pub struct NativeUnwinder {
+    pid: Pid,
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    unwinder: remoteprocess::Unwinder,
+}
+
+impl NativeUnwinder {
+    /// Build an unwinder for `pid`. `Some` only on supported platforms (Linux x86_64, or
+    /// macOS x86_64/arm64); `None` elsewhere.
+    pub fn new(pid: Pid) -> Option<Self> {
+        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+        {
+            let process = remoteprocess::Process::new(pid).ok()?;
+            let unwinder = process.unwinder().ok()?;
+            Some(Self { pid, unwinder })
+        }
+
+        #[cfg(all(target_os = "macos", any(target_arch = "x86_64", target_arch = "aarch64")))]
+        {
+            Some(Self { pid })
+        }
+
+        #[cfg(not(any(
+            all(target_os = "linux", target_arch = "x86_64"),
+            all(target_os = "macos", any(target_arch = "x86_64", target_arch = "aarch64"))
+        )))]
+        {
+            let _ = pid;
+            None
+        }
+    }
+
+    /// Capture the target's native call stack (innermost frame first). Best-effort: any
+    /// failure yields an empty vec — the Lua stack is always the primary signal.
+    pub fn frames(&self, reader: &dyn ProcessMemoryReader) -> Vec<NativeFrame> {
+        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+        {
+            let _ = reader;
+            self.linux_frames()
+        }
+
+        #[cfg(all(target_os = "macos", any(target_arch = "x86_64", target_arch = "aarch64")))]
+        {
+            macos::get_native_frames(nix::unistd::Pid::from_raw(self.pid), reader)
+                .unwrap_or_default()
+        }
+
+        #[cfg(not(any(
+            all(target_os = "linux", target_arch = "x86_64"),
+            all(target_os = "macos", any(target_arch = "x86_64", target_arch = "aarch64"))
+        )))]
+        {
+            let _ = reader;
+            Vec::new()
+        }
+    }
+
+    /// Lock the main thread and walk the libunwind cursor.
+    ///
+    /// Note: `Thread::lock` and `SpawnedChild::has_exited` both `waitpid` the same child, but
+    /// they run sequentially within a sample tick (never concurrently), and failures here are
+    /// non-fatal — do not "fix" flakiness by dropping the lock; the lock is required for
+    /// libunwind-ptrace to read the target's registers/memory.
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    fn linux_frames(&self) -> Vec<NativeFrame> {
+        use log::debug;
+
+        // Main thread: tid == pid. The single-VM interpreter runs here.
+        let thread = match remoteprocess::Thread::new(self.pid) {
+            Ok(t) => t,
+            Err(e) => {
+                debug!("native: Thread::new failed: {}", e);
+                return Vec::new();
+            }
+        };
+
+        let _lock = match thread.lock() {
+            Ok(l) => l,
+            Err(e) => {
+                debug!("native: thread lock failed: {}", e);
+                return Vec::new();
+            }
+        };
+
+        let cursor = match self.unwinder.cursor(&thread) {
+            Ok(c) => c,
+            Err(e) => {
+                debug!("native: cursor failed: {}", e);
+                return Vec::new();
+            }
+        };
+
+        let mut frames = Vec::new();
+        for ip in cursor {
+            match ip {
+                Ok(ip) => frames.push(NativeFrame {
+                    ip: ip as usize,
+                    fp: 0,
+                }),
+                Err(_) => break,
+            }
+            if frames.len() >= 128 {
+                break;
+            }
+        }
+        frames
+    }
+}
+
+/// Native stack walker - captures C-level call stacks (frame-pointer chain, used on macOS)
 pub struct NativeStackWalker<'a> {
     reader: &'a dyn ProcessMemoryReader,
 }
@@ -27,55 +152,55 @@ impl<'a> NativeStackWalker<'a> {
     pub fn walk(&self, initial_fp: usize, initial_ip: usize) -> Result<Vec<NativeFrame>> {
         let mut frames = Vec::new();
         let mut fp = initial_fp;
-        
+
         // Add the initial frame
         if initial_ip != 0 {
             frames.push(NativeFrame { ip: initial_ip, fp: initial_fp });
         }
-        
+
         // Walk frame pointer chain (x86_64 calling convention)
         // Each frame: [saved_rbp, return_address]
         let max_depth = 128;
         let mut visited = std::collections::HashSet::new();
-        
+
         while fp != 0 && frames.len() < max_depth {
             // Detect loops
             if !visited.insert(fp) {
                 break;
             }
-            
+
             // Validate frame pointer looks reasonable
             if fp < 0x1000 || fp > 0x7fffffffffff {
                 break;
             }
-            
+
             // Read saved frame pointer and return address
             // Frame layout: [saved_rbp (8 bytes), return_address (8 bytes)]
             let frame_data = match self.reader.read_memory(fp, 16) {
                 Ok(data) => data,
                 Err(_) => break,
             };
-            
+
             let saved_fp = u64::from_ne_bytes([
                 frame_data[0], frame_data[1], frame_data[2], frame_data[3],
                 frame_data[4], frame_data[5], frame_data[6], frame_data[7],
             ]) as usize;
-            
+
             let return_addr = u64::from_ne_bytes([
                 frame_data[8], frame_data[9], frame_data[10], frame_data[11],
                 frame_data[12], frame_data[13], frame_data[14], frame_data[15],
             ]) as usize;
-            
+
             // Validate return address looks like code
             if return_addr == 0 || return_addr < 0x1000 {
                 break;
             }
-            
+
             frames.push(NativeFrame {
                 ip: return_addr,
                 fp: saved_fp,
             });
-            
+
             // Move to next frame
             if saved_fp <= fp {
                 // Stack grows down, so saved_fp should be greater
@@ -83,7 +208,7 @@ impl<'a> NativeStackWalker<'a> {
             }
             fp = saved_fp;
         }
-        
+
         Ok(frames)
     }
 }
@@ -100,13 +225,12 @@ pub mod macos {
     type ThreadState = u32;
 
     const KERN_SUCCESS: KernReturn = 0;
-    const THREAD_STATE_NONE: ThreadState = 0;
-    
+
     // x86_64 thread state flavor
     const X86_THREAD_STATE64: ThreadState = 4;
     const X86_THREAD_STATE64_COUNT: u32 = 42;
-    
-    // ARM64 thread state flavor  
+
+    // ARM64 thread state flavor
     const ARM_THREAD_STATE64: ThreadState = 6;
     const ARM_THREAD_STATE64_COUNT: u32 = 68;
 
@@ -174,10 +298,10 @@ pub mod macos {
             // Get state of first thread (main thread)
             if thread_count > 0 {
                 let thread = *threads;
-                
+
                 // Suspend thread for consistent state
                 thread_suspend(thread);
-                
+
                 // Try x86_64 first, then ARM64
                 #[cfg(target_arch = "x86_64")]
                 {
@@ -189,7 +313,7 @@ pub mod macos {
                         &mut state as *mut _ as *mut u8,
                         &mut count,
                     );
-                    
+
                     if kr == KERN_SUCCESS {
                         let walker = NativeStackWalker::new(reader);
                         if let Ok(frames) = walker.walk(state.rbp as usize, state.rip as usize) {
@@ -197,7 +321,7 @@ pub mod macos {
                         }
                     }
                 }
-                
+
                 #[cfg(target_arch = "aarch64")]
                 {
                     let mut state = Arm64ThreadState::default();
@@ -208,7 +332,7 @@ pub mod macos {
                         &mut state as *mut _ as *mut u8,
                         &mut count,
                     );
-                    
+
                     if kr == KERN_SUCCESS {
                         let walker = NativeStackWalker::new(reader);
                         if let Ok(frames) = walker.walk(state.fp as usize, state.pc as usize) {
@@ -216,7 +340,7 @@ pub mod macos {
                         }
                     }
                 }
-                
+
                 // Resume thread
                 thread_resume(thread);
             }
@@ -226,47 +350,6 @@ pub mod macos {
             vm_deallocate(mach_task_self(), threads as usize, threads_size);
 
             Ok(all_frames)
-        }
-    }
-}
-
-#[cfg(target_os = "linux")]
-pub mod linux {
-    use super::*;
-    use nix::unistd::Pid;
-    use nix::sys::ptrace;
-    use nix::sys::wait::waitpid;
-
-    /// Get native stack frames for a process on Linux
-    pub fn get_native_frames(
-        pid: Pid,
-        reader: &dyn ProcessMemoryReader,
-    ) -> Result<Vec<NativeFrame>> {
-        // On Linux, we need ptrace to read registers
-        // The process should already be attached via remoteprocess
-        
-        #[cfg(target_arch = "x86_64")]
-        {
-            // Try to read registers using ptrace
-            match ptrace::getregs(pid) {
-                Ok(regs) => {
-                    let walker = NativeStackWalker::new(reader);
-                    walker.walk(regs.rbp as usize, regs.rip as usize)
-                }
-                Err(_) => Ok(Vec::new()),
-            }
-        }
-        
-        #[cfg(target_arch = "aarch64")]
-        {
-            // ARM64 register access is different
-            // For now, return empty
-            Ok(Vec::new())
-        }
-        
-        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
-        {
-            Ok(Vec::new())
         }
     }
 }

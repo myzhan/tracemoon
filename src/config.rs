@@ -12,17 +12,31 @@ pub const DEFAULT_SAMPLE_RATE: u32 = 100;
 /// Default duration (0 = run until Ctrl+C)
 pub const DEFAULT_DURATION: u64 = 0;
 
+/// Output mode selected by the subcommand.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum RunMode {
+    /// Sample for a duration and write a flamegraph / collapsed file.
+    Record,
+    /// Print a one-shot snapshot of the current stack(s) and exit.
+    Dump,
+    /// Live-updating terminal view of the hottest functions.
+    Top,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Config {
+    /// Output mode (record / dump / top).
+    pub mode: RunMode,
+
     /// PID of the target Lua process
     pub pid: Option<Pid>,
-    
+
     /// Sample rate in Hz (samples per second)
     pub sample_rate: u32,
-    
+
     /// Duration in seconds (0 = run until Ctrl+C)
     pub duration: u64,
-    
+
     /// Output file path (None = stdout)
     pub output_file: Option<String>,
 
@@ -36,6 +50,7 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
+            mode: RunMode::Record,
             pid: None,
             sample_rate: DEFAULT_SAMPLE_RATE,
             duration: DEFAULT_DURATION,
@@ -55,123 +70,163 @@ impl Config {
 
     /// Parse configuration from argument list
     pub fn from_args(args: &[String]) -> clap::Result<Config> {
-        let pid_arg = Arg::new("pid")
-            .short('p')
-            .long("pid")
-            .value_name("PID")
-            .help("Attach to a running Lua process by PID (mutually exclusive with -- <cmd>)")
-            .takes_value(true);
-
-        let rate_arg = Arg::new("rate")
-            .short('r')
-            .long("rate")
-            .value_name("HZ")
-            .help("Sample rate in Hz (samples per second)")
-            .default_value("100")
-            .takes_value(true);
-
-        let duration_arg = Arg::new("duration")
-            .short('d')
-            .long("duration")
-            .value_name("SECONDS")
-            .help("Duration in seconds (0 = run until Ctrl+C)")
-            .default_value("0")
-            .takes_value(true);
-
-        let output_arg = Arg::new("output")
-            .short('o')
-            .long("output")
-            .value_name("FILE")
-            .help("Output file path (.svg for flamegraph, .txt for collapsed stacks)")
-            .default_value("flamegraph.svg")
-            .takes_value(true);
-
-        let lua_version_arg = Arg::new("lua-version")
-            .long("lua-version")
-            .value_name("VERSION")
-            .help("Force the Lua version layout (5.4 or 5.5). Default: auto-detect")
-            .takes_value(true);
-
-        let command_arg = Arg::new("command")
-            .value_name("COMMAND")
-            .help("Command to spawn and profile (after --). Mutually exclusive with -p")
-            .last(true)
-            .multiple_values(true)
-            .takes_value(true);
-
         let record_cmd = Command::new("record")
-            .about("Record a Lua profile")
-            .arg(pid_arg)
-            .arg(rate_arg)
-            .arg(duration_arg)
-            .arg(output_arg)
-            .arg(lua_version_arg)
-            .arg(command_arg);
+            .about("Record a Lua profile to a flamegraph / collapsed file")
+            .args(shared_args())
+            .arg(
+                Arg::new("output")
+                    .short('o')
+                    .long("output")
+                    .value_name("FILE")
+                    .help("Output file path (.svg for flamegraph, .txt for collapsed stacks)")
+                    .default_value("flamegraph.svg")
+                    .takes_value(true),
+            );
+
+        let dump_cmd = Command::new("dump")
+            .about("Print a one-shot snapshot of the current stack(s) and exit")
+            .arg(pid_arg())
+            .arg(lua_version_arg())
+            .arg(command_arg());
+
+        let top_cmd = Command::new("top")
+            .about("Live-updating terminal view of the hottest functions")
+            .args(shared_args());
 
         let app = Command::new(crate_name!())
             .version(crate_version!())
             .about("A sampling profiler for Lua (5.4 / 5.5, incl. skynet multi-VM)")
             .subcommand_required(true)
-            .subcommand(record_cmd);
+            .subcommand(record_cmd)
+            .subcommand(dump_cmd)
+            .subcommand(top_cmd);
 
         let matches = app.try_get_matches_from(args)?;
 
         let mut config = Config::default();
 
-        if let Some(("record", sub_matches)) = matches.subcommand() {
-            // Parse PID (required)
-            if let Some(pid_str) = sub_matches.value_of("pid") {
-                config.pid = Some(
-                    pid_str
-                        .parse()
-                        .expect("Invalid PID: must be a positive integer"),
-                );
-            }
+        let (mode, sub_matches) = match matches.subcommand() {
+            Some(("record", m)) => (RunMode::Record, m),
+            Some(("dump", m)) => (RunMode::Dump, m),
+            Some(("top", m)) => (RunMode::Top, m),
+            _ => return Ok(config),
+        };
+        config.mode = mode;
 
-            // Parse sample rate
+        // PID (optional; attach path)
+        if let Some(pid_str) = sub_matches.value_of("pid") {
+            config.pid = Some(pid_str.parse().map_err(|_| {
+                clap::Error::raw(
+                    clap::ErrorKind::InvalidValue,
+                    format!("Invalid PID '{}': must be a positive integer\n", pid_str),
+                )
+            })?);
+        }
+
+        // Sample rate (record/top only; dump has no rate arg)
+        if mode != RunMode::Dump {
             if let Some(rate_str) = sub_matches.value_of("rate") {
-                config.sample_rate = rate_str
-                    .parse()
-                    .expect("Invalid rate: must be a positive integer");
-                
-                if config.sample_rate == 0 {
-                    config.sample_rate = DEFAULT_SAMPLE_RATE;
-                }
-            }
-
-            // Parse duration
-            if let Some(duration_str) = sub_matches.value_of("duration") {
-                config.duration = duration_str
-                    .parse()
-                    .expect("Invalid duration: must be a non-negative integer");
-            }
-
-            // Parse output file
-            config.output_file = sub_matches.value_of("output").map(String::from);
-
-            // Parse optional Lua version override
-            if let Some(v) = sub_matches.value_of("lua-version") {
-                let parsed = v.parse().map_err(|_| {
+                let rate: u32 = rate_str.parse().map_err(|_| {
                     clap::Error::raw(
                         clap::ErrorKind::InvalidValue,
-                        format!("Invalid --lua-version '{}': expected 5.4 or 5.5\n", v),
+                        format!("Invalid rate '{}': must be a positive integer\n", rate_str),
                     )
                 })?;
-                config.lua_version = Some(parsed);
+                config.sample_rate = if rate == 0 { DEFAULT_SAMPLE_RATE } else { rate };
             }
+        }
 
-            // Parse trailing spawn command (after `--`)
-            if let Some(values) = sub_matches.values_of("command") {
-                let argv: Vec<String> = values.map(String::from).collect();
-                if !argv.is_empty() {
-                    config.command = Some(argv);
-                }
+        // Duration (record/top only)
+        if mode != RunMode::Dump {
+            if let Some(duration_str) = sub_matches.value_of("duration") {
+                config.duration = duration_str.parse().map_err(|_| {
+                    clap::Error::raw(
+                        clap::ErrorKind::InvalidValue,
+                        format!(
+                            "Invalid duration '{}': must be a non-negative integer\n",
+                            duration_str
+                        ),
+                    )
+                })?;
+            }
+        }
+
+        // Output file (record only)
+        if mode == RunMode::Record {
+            config.output_file = sub_matches.value_of("output").map(String::from);
+        }
+
+        // Optional Lua version override
+        if let Some(v) = sub_matches.value_of("lua-version") {
+            let parsed = v.parse().map_err(|_| {
+                clap::Error::raw(
+                    clap::ErrorKind::InvalidValue,
+                    format!("Invalid --lua-version '{}': expected 5.4 or 5.5\n", v),
+                )
+            })?;
+            config.lua_version = Some(parsed);
+        }
+
+        // Trailing spawn command (after `--`)
+        if let Some(values) = sub_matches.values_of("command") {
+            let argv: Vec<String> = values.map(String::from).collect();
+            if !argv.is_empty() {
+                config.command = Some(argv);
             }
         }
 
         info!("Configuration: {:?}", config);
         Ok(config)
     }
+}
+
+fn pid_arg() -> Arg<'static> {
+    Arg::new("pid")
+        .short('p')
+        .long("pid")
+        .value_name("PID")
+        .help("Attach to a running Lua process by PID (mutually exclusive with -- <cmd>)")
+        .takes_value(true)
+}
+
+fn lua_version_arg() -> Arg<'static> {
+    Arg::new("lua-version")
+        .long("lua-version")
+        .value_name("VERSION")
+        .help("Force the Lua version layout (5.4 or 5.5). Default: auto-detect")
+        .takes_value(true)
+}
+
+fn command_arg() -> Arg<'static> {
+    Arg::new("command")
+        .value_name("COMMAND")
+        .help("Command to spawn and profile (after --). Mutually exclusive with -p")
+        .last(true)
+        .multiple_values(true)
+        .takes_value(true)
+}
+
+/// Args shared by `record` and `top` (dump uses a narrower subset).
+fn shared_args() -> Vec<Arg<'static>> {
+    vec![
+        pid_arg(),
+        Arg::new("rate")
+            .short('r')
+            .long("rate")
+            .value_name("HZ")
+            .help("Sample rate in Hz (samples per second)")
+            .default_value("100")
+            .takes_value(true),
+        Arg::new("duration")
+            .short('d')
+            .long("duration")
+            .value_name("SECONDS")
+            .help("Duration in seconds (0 = run until Ctrl+C)")
+            .default_value("0")
+            .takes_value(true),
+        lua_version_arg(),
+        command_arg(),
+    ]
 }
 
 #[cfg(test)]
@@ -263,5 +318,83 @@ mod tests {
         let config = Config::from_args(&args).unwrap();
         assert_eq!(config.pid, Some(5));
         assert_eq!(config.command, None);
+    }
+
+    #[test]
+    fn test_record_mode_default() {
+        let args = vec![
+            "tracemoon".to_string(),
+            "record".to_string(),
+            "-p".to_string(),
+            "5".to_string(),
+        ];
+        let config = Config::from_args(&args).unwrap();
+        assert_eq!(config.mode, RunMode::Record);
+    }
+
+    #[test]
+    fn test_parse_dump_attach() {
+        let args = vec![
+            "tracemoon".to_string(),
+            "dump".to_string(),
+            "-p".to_string(),
+            "1234".to_string(),
+        ];
+        let config = Config::from_args(&args).unwrap();
+        assert_eq!(config.mode, RunMode::Dump);
+        assert_eq!(config.pid, Some(1234));
+        assert_eq!(config.command, None);
+    }
+
+    #[test]
+    fn test_parse_dump_spawn() {
+        let args = vec![
+            "tracemoon".to_string(),
+            "dump".to_string(),
+            "--".to_string(),
+            "lua".to_string(),
+            "x.lua".to_string(),
+        ];
+        let config = Config::from_args(&args).unwrap();
+        assert_eq!(config.mode, RunMode::Dump);
+        assert_eq!(config.pid, None);
+        assert_eq!(
+            config.command,
+            Some(vec!["lua".to_string(), "x.lua".to_string()])
+        );
+    }
+
+    #[test]
+    fn test_parse_top_spawn() {
+        let args = vec![
+            "tracemoon".to_string(),
+            "top".to_string(),
+            "-r".to_string(),
+            "250".to_string(),
+            "--".to_string(),
+            "lua".to_string(),
+            "x.lua".to_string(),
+        ];
+        let config = Config::from_args(&args).unwrap();
+        assert_eq!(config.mode, RunMode::Top);
+        assert_eq!(config.pid, None);
+        assert_eq!(config.sample_rate, 250);
+        assert_eq!(
+            config.command,
+            Some(vec!["lua".to_string(), "x.lua".to_string()])
+        );
+    }
+
+    #[test]
+    fn test_parse_top_attach() {
+        let args = vec![
+            "tracemoon".to_string(),
+            "top".to_string(),
+            "-p".to_string(),
+            "9".to_string(),
+        ];
+        let config = Config::from_args(&args).unwrap();
+        assert_eq!(config.mode, RunMode::Top);
+        assert_eq!(config.pid, Some(9));
     }
 }

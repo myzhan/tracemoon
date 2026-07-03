@@ -9,8 +9,9 @@ aren't discoverable from a quick skim of the code.
 tracemoon is a **sampling profiler for Lua 5.4 / 5.5**, modeled on
 [py-spy](https://github.com/benfred/py-spy). It reads a target process's memory from the
 outside (no code injection, no instrumentation), walks the Lua `CallInfo` chain and the
-native C frame-pointer chain, aggregates samples, and emits a flamegraph SVG or collapsed
-stacks. It has first-class support for **skynet**, which hosts many Lua VMs in one process.
+native C stack (libunwind-ptrace on Linux x86_64), aggregates samples, and emits a flamegraph
+SVG / collapsed stacks (`record`), a one-shot snapshot (`dump`), or a live top view (`top`). It
+has first-class support for **skynet**, which hosts many Lua VMs in one process.
 
 Two targeting modes:
 - **Attach** (`-p PID`): profile an already-running process.
@@ -78,7 +79,7 @@ Module map:
   - `discovery.rs` — `LuaStateDiscovery` (memory scan for a valid `lua_State`) +
     `detect_lua_version` (scans mapped files' rodata for the `Lua 5.N` string).
   - `skynet.rs` — `SkynetDiscovery`: walk `H` → slots → `snlua.activeL`, one VM per service.
-  - `native_stack.rs` — native C frame-pointer walk (needs `ptrace::getregs`).
+  - `native_stack.rs` — `NativeUnwinder` (Linux x86_64 libunwind-ptrace) + macOS FP walk.
   - `spawn.rs` — `SpawnedChild` (spawn/resume/has_exited/terminate).
 - `src/symbols/`
   - `resolver.rs` — ELF/Mach-O symbol resolution (addr → function name) +
@@ -162,11 +163,29 @@ relevant area.**
   fall back to `[C]:0x...` — that's correct, not a bug.
 
 ### Native stack (`native_stack.rs`)
-- x86_64 only for real frames (walks the rbp chain via `ptrace::getregs`). aarch64 returns
-  empty (TODO). Needs to be the ptrace tracer with the target stopped.
-- **In both attach and spawn modes `getregs` returns empty** (attach: we're not the tracer;
-  spawn: we `detach` before sampling). So native merge is best-effort and usually empty on
-  Linux — this is expected, not a regression. The Lua stack is always the primary signal.
+- Linux x86_64: `NativeUnwinder` unwinds the real C chain (`luaV_execute → luaD_call → … →
+  main → _libc_start_main`) via `remoteprocess`'s libunwind-ptrace backend. It holds a reusable
+  `Unwinder` (built once in `new`, reused every tick), and each `frames()` call does
+  `Thread::new(pid)` → `thread.lock()` (ptrace seize+interrupt, detach on drop) → walk
+  `unwinder.cursor(&thread)`, innermost-first, capped at 128. Best-effort: any error → empty vec.
+  aarch64 returns empty (no unwinder built).
+- **Spawn mode works without root:** we are the child's parent, so ptrace seize is permitted
+  even under `kernel.yama.ptrace_scope=1`. Attach mode needs the same privileges attach already
+  requires.
+- **Single-VM only.** `NativeUnwinder` is built only for `Mode::Single` (the interpreter runs on
+  the main thread, tid==pid). Skynet keeps native merge disabled — a ptrace snapshot maps to a
+  worker thread, not a service.
+- **Merge ordering** (`sampler.rs::sample_single`): the aggregator wants the whole stack
+  deepest-first (current frame at index 0). Both the Lua walker and the native cursor yield
+  innermost-first, so we append the native chain *after* the Lua frames with no reversing. Do
+  not reintroduce a `native.rev()` prepend — that inverts the flamegraph (process entry ends up
+  at the leaf).
+- **`waitpid` caveat:** `Thread::lock` and `SpawnedChild::has_exited` both `waitpid` the same
+  child, but run sequentially within a tick (never concurrently), and native failures degrade to
+  empty — don't "fix" perceived flakiness by dropping the lock; libunwind-ptrace needs the
+  target stopped to read its registers/memory.
+- macOS keeps the frame-pointer walk (`NativeStackWalker` + `macos::get_native_frames`) via
+  `task_for_pid`, unchanged.
 
 ### Spawn mode no-missed-startup mechanism (`spawn.rs`)
 - Linux: child calls `PTRACE_TRACEME` in `pre_exec` → kernel stops it with `SIGTRAP`
@@ -210,7 +229,7 @@ relevant area.**
 | | Linux x86_64 | Linux aarch64 | macOS x86_64/arm64 |
 |---|---|---|---|
 | Lua stack walk | ✅ | ✅ | ✅ |
-| Native C merge | ✅ (best-effort) | ❌ empty | ✅ (task_for_pid) |
+| Native C merge | ✅ (libunwind-ptrace) | ❌ empty | ✅ (task_for_pid) |
 | Spawn no-miss-startup | ✅ (ptrace hold) | ✅ | ⚠️ best-effort |
 | Symbol resolution | ELF | ELF | Mach-O |
 

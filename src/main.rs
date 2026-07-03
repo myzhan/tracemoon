@@ -17,9 +17,9 @@ mod symbols;
 
 use std::process::ExitCode;
 
-use config::Config;
+use config::{Config, RunMode};
 use error::TracemoonError;
-use sampler::{run_profiler, run_profiler_spawn};
+use sampler::{run_dump, run_profiler, run_profiler_spawn, run_top};
 
 fn check_permissions() {
     #[cfg(target_os = "macos")]
@@ -49,6 +49,14 @@ fn check_permissions() {
 
 fn run() -> Result<(), TracemoonError> {
     let config = Config::from_commandline();
+
+    // dump/top validate the target internally (via build_target); record keeps its
+    // existing attach-vs-spawn split so spawn owns the child lifecycle.
+    match config.mode {
+        RunMode::Dump => return run_dump(config.pid, config.command.clone(), config),
+        RunMode::Top => return run_top(config.pid, config.command.clone(), config),
+        RunMode::Record => {}
+    }
 
     match (config.pid, config.command.clone()) {
         (Some(_), Some(_)) => {
