@@ -21,7 +21,12 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        # `macos-latest` resolves to an arm64 runner, and GitHub's arm64 macOS pool has
+        # chronic capacity problems — jobs sit in the queue and are eventually cancelled
+        # with "not acquired by Runner of type hosted". The Intel image is x86_64 and
+        # queues normally; between the two we still cover both macOS architectures
+        # across runner images.
+        os: [ubuntu-latest, macos-15-intel]
     steps:
       - uses: actions/checkout@v4
 

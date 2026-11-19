@@ -287,6 +287,11 @@ relevant area.**
    `dead_code` warning: delete dead helpers instead of leaving them, and use the targeted
    `allow(dead_code)` only where an item is documentation (the `LuaLayout` table fields,
    `lua/types.rs`).
+   A local `clippy` run only compiles the host platform's `cfg` branches, so an item that is
+   unused on *another* platform (an `unused import` inside `#[cfg(target_os = "linux")]`, a
+   `NativeStackWalker` that only macOS constructs) stays invisible until CI builds that
+   target. When you touch a `#[cfg(...)]` block, either reason through the other platform or
+   let the CI matrix be the gate — do not declare the change warning-free off a host-only run.
 3. **Functional test in spawn mode** (Linux; no root needed) after any change to walking,
    discovery, layout, or symbols:
    - Single VM: `-- lua tests/lua/multi_func.lua` (5.4). Expect ~99% success, real C
