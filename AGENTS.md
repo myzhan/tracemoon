@@ -18,6 +18,11 @@ Two targeting modes:
 - **Spawn** (`-- <cmd>`): tracemoon launches the child itself and profiles from `t=0`, so
   startup work isn't missed (see "Spawn mode" below).
 
+Two companion documents: `docs/lua-profiler-ptrace.md` explains how the current machinery
+works, and `docs/roadmap.md` holds the backlog (tiered, with the invariants each planned
+feature has to respect). Read the roadmap before inventing a design for a new feature — the
+constraints and the rejected alternatives are already written down there.
+
 ## Build, test, run
 
 ```bash

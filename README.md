@@ -178,6 +178,10 @@ process means occasionally reading a half-written structure.
      load base taken from the lowest mapping / `__TEXT`)
 6. **Output** aggregated stacks as flamegraph SVG or collapsed text
 
+Deeper design notes are in [docs/lua-profiler-ptrace.md](docs/lua-profiler-ptrace.md); what we
+plan to build next (long-tail stalls, speedscope, per-service views, memory sampling,
+LuaJIT) is in [docs/roadmap.md](docs/roadmap.md).
+
 ## Debug Logging
 
 ```bash
