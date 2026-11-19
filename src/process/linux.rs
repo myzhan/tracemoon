@@ -4,7 +4,6 @@ use crate::error::{Result, TracemoonError};
 use crate::process::reader::{map_read_error, ProcessMemoryReader};
 use read_process_memory::{CopyAddress, Pid as RpmPid, ProcessHandle};
 use remoteprocess::Pid;
-use std::io;
 
 /// Linux memory reader using read-process-memory crate
 pub struct LinuxMemoryReader {

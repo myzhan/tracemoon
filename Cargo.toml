@@ -4,12 +4,9 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-anyhow = "1"
 clap = {version="3.2", features=["wrap_help", "cargo", "derive"]}
-clap_complete="3.2"
 env_logger = "0.10"
 remoteprocess = {version="0.5.0", features=["unwind"]}
-chrono = "0.4.26"
 libc = "0.2"
 log = "0.4"
 thiserror = "1"

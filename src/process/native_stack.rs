@@ -10,9 +10,12 @@
 //! On macOS the frame-pointer walker below (`NativeStackWalker` + `macos::get_native_frames`)
 //! is used via `task_for_pid`. On unsupported platforms native stacks are empty.
 
-use crate::error::Result;
 use crate::process::ProcessMemoryReader;
 use remoteprocess::Pid;
+// Only the macOS frame-pointer walker returns a `Result`; on Linux the libunwind path is
+// infallible-by-degradation (an empty vec on error), so importing this there is unused.
+#[cfg(target_os = "macos")]
+use crate::error::Result;
 
 /// A native stack frame
 #[derive(Debug, Clone)]
@@ -145,10 +148,15 @@ impl NativeUnwinder {
 }
 
 /// Native stack walker - captures C-level call stacks (frame-pointer chain, used on macOS)
+///
+/// Linux takes the libunwind-ptrace path instead ([`NativeUnwinder`]), so this walker exists
+/// only on macOS — compiling it everywhere makes it dead code on Linux.
+#[cfg(target_os = "macos")]
 pub struct NativeStackWalker<'a> {
     reader: &'a dyn ProcessMemoryReader,
 }
 
+#[cfg(target_os = "macos")]
 impl<'a> NativeStackWalker<'a> {
     pub fn new(reader: &'a dyn ProcessMemoryReader) -> Self {
         Self { reader }
@@ -249,7 +257,9 @@ pub mod macos {
     const X86_THREAD_STATE64_COUNT: u32 = 42;
 
     // ARM64 thread state flavor
+    #[cfg(target_arch = "aarch64")]
     const ARM_THREAD_STATE64: ThreadState = 6;
+    #[cfg(target_arch = "aarch64")]
     const ARM_THREAD_STATE64_COUNT: u32 = 68;
 
     #[cfg(target_arch = "x86_64")]
@@ -279,6 +289,7 @@ pub mod macos {
         gs: u64,
     }
 
+    #[cfg(target_arch = "aarch64")]
     #[repr(C)]
     #[derive(Debug, Default)]
     struct Arm64ThreadState {
