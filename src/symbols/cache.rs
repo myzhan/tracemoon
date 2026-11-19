@@ -1,15 +1,20 @@
 //! Symbol caching for performance optimization
 
-use std::collections::HashMap;
+use std::collections::hash_map::Entry;
+use std::collections::{HashMap, VecDeque};
 
-/// LRU-style cache for symbol resolution results
+/// Bounded (FIFO-evicting) cache for symbol resolution results.
+///
+/// Eviction is first-in-first-out, not LRU: hits do not reorder entries. That is
+/// deliberate — resolved addresses stay hot for the whole run, so the cheaper policy is
+/// enough, and the name says what the code actually does.
 pub struct SymbolCache {
     /// Address -> Symbol name mapping
     cache: HashMap<usize, String>,
     /// Maximum cache size
     max_size: usize,
-    /// Access order for LRU eviction (simplified - just track insertions)
-    order: Vec<usize>,
+    /// Insertion order, used to pick the oldest entry to evict.
+    order: VecDeque<usize>,
 }
 
 impl SymbolCache {
@@ -18,7 +23,7 @@ impl SymbolCache {
         Self {
             cache: HashMap::with_capacity(max_size),
             max_size,
-            order: Vec::with_capacity(max_size),
+            order: VecDeque::with_capacity(max_size),
         }
     }
 
@@ -29,37 +34,26 @@ impl SymbolCache {
 
     /// Insert a symbol into the cache
     pub fn insert(&mut self, addr: usize, name: String) {
-        if self.cache.contains_key(&addr) {
-            // Already exists, just update
-            self.cache.insert(addr, name);
+        // Already cached: update in place and keep its place in the eviction queue.
+        if let Entry::Occupied(mut entry) = self.cache.entry(addr) {
+            entry.insert(name);
             return;
         }
-        
-        // Evict if at capacity
-        if self.cache.len() >= self.max_size && !self.order.is_empty() {
-            // Simple FIFO eviction for simplicity
-            let old_addr = self.order.remove(0);
-            self.cache.remove(&old_addr);
-        }
-        
-        self.cache.insert(addr, name);
-        self.order.push(addr);
-    }
 
-    /// Clear the cache
-    pub fn clear(&mut self) {
-        self.cache.clear();
-        self.order.clear();
+        if self.cache.len() >= self.max_size {
+            if let Some(oldest) = self.order.pop_front() {
+                self.cache.remove(&oldest);
+            }
+        }
+
+        self.cache.insert(addr, name);
+        self.order.push_back(addr);
     }
 
     /// Get the number of cached entries
+    #[cfg(test)]
     pub fn len(&self) -> usize {
         self.cache.len()
-    }
-
-    /// Check if cache is empty
-    pub fn is_empty(&self) -> bool {
-        self.cache.is_empty()
     }
 }
 
@@ -70,10 +64,10 @@ mod tests {
     #[test]
     fn test_cache_basic() {
         let mut cache = SymbolCache::new(100);
-        
+
         cache.insert(0x1000, "func1".to_string());
         cache.insert(0x2000, "func2".to_string());
-        
+
         assert_eq!(cache.get(0x1000), Some(&"func1".to_string()));
         assert_eq!(cache.get(0x2000), Some(&"func2".to_string()));
         assert_eq!(cache.get(0x3000), None);
@@ -82,11 +76,11 @@ mod tests {
     #[test]
     fn test_cache_eviction() {
         let mut cache = SymbolCache::new(2);
-        
+
         cache.insert(0x1000, "func1".to_string());
         cache.insert(0x2000, "func2".to_string());
         cache.insert(0x3000, "func3".to_string());
-        
+
         // First entry should be evicted
         assert_eq!(cache.get(0x1000), None);
         assert_eq!(cache.get(0x2000), Some(&"func2".to_string()));
@@ -96,10 +90,10 @@ mod tests {
     #[test]
     fn test_cache_update() {
         let mut cache = SymbolCache::new(100);
-        
+
         cache.insert(0x1000, "func1".to_string());
         cache.insert(0x1000, "func1_updated".to_string());
-        
+
         assert_eq!(cache.get(0x1000), Some(&"func1_updated".to_string()));
         assert_eq!(cache.len(), 1);
     }

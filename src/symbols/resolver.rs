@@ -10,8 +10,8 @@ use std::sync::Mutex;
 /// Resolve a named symbol to its runtime address in a target process.
 ///
 /// Scans each mapped binary for `symbol_name`, then applies the PIE load bias
-/// (mapping base minus the file's lowest loadable vaddr) to translate the
-/// linked vaddr into a runtime address.
+/// (mapping base minus the file's link base) to translate the linked vaddr into a
+/// runtime address.
 pub fn resolve_symbol_address(pid: Pid, symbol_name: &str) -> Option<usize> {
     let maps = proc_maps::get_process_maps(pid as proc_maps::Pid).ok()?;
 
@@ -42,10 +42,13 @@ pub fn resolve_symbol_address(pid: Pid, symbol_name: &str) -> Option<usize> {
             Err(_) => continue,
         };
 
+        let wanted = link_name(&file, symbol_name);
         let sym_vaddr = file
             .symbols()
             .chain(file.dynamic_symbols())
-            .find(|s| s.name().map(|n| n == symbol_name).unwrap_or(false))
+            // Undefined imports (`H@GLIBC_…`) have address 0 and would match anything.
+            .filter(|s| !s.is_undefined())
+            .find(|s| s.name().map(|n| n == wanted.as_ref()).unwrap_or(false))
             .map(|s| s.address());
 
         let sym_vaddr = match sym_vaddr {
@@ -53,18 +56,12 @@ pub fn resolve_symbol_address(pid: Pid, symbol_name: &str) -> Option<usize> {
             _ => continue,
         };
 
-        // Lowest loadable segment vaddr = the file's link base (0 for PIE).
-        let min_vaddr = file
-            .segments()
-            .map(|s| s.address())
-            .min()
-            .unwrap_or(0);
-
-        let bias = base as u64 - min_vaddr;
+        let file_base_vaddr = link_base(&file);
+        let bias = (base as u64).saturating_sub(file_base_vaddr);
         let runtime = (sym_vaddr + bias) as usize;
         debug!(
-            "Resolved symbol {} @ vaddr 0x{:x} -> runtime 0x{:x} (base 0x{:x}, min_vaddr 0x{:x}) in {}",
-            symbol_name, sym_vaddr, runtime, base, min_vaddr, path
+            "Resolved symbol {} @ vaddr 0x{:x} -> runtime 0x{:x} (base 0x{:x}, link base 0x{:x}) in {}",
+            symbol_name, sym_vaddr, runtime, base, file_base_vaddr, path
         );
         return Some(runtime);
     }
@@ -72,12 +69,43 @@ pub fn resolve_symbol_address(pid: Pid, symbol_name: &str) -> Option<usize> {
     None
 }
 
+/// The in-file name of `symbol_name` for this object format.
+///
+/// Mach-O prefixes C symbols with an underscore (`H` is stored as `_H`), so a raw name
+/// comparison silently fails there and skynet detection degenerates to single-VM mode.
+/// Only the Mach-O *lookup* name is normalized; ELF names are used verbatim.
+fn link_name<'a>(file: &object::File, symbol_name: &'a str) -> std::borrow::Cow<'a, str> {
+    match file.format() {
+        object::BinaryFormat::MachO => std::borrow::Cow::Owned(format!("_{}", symbol_name)),
+        _ => std::borrow::Cow::Borrowed(symbol_name),
+    }
+}
+
+/// The file's link-time base vaddr, used to turn a runtime address into a file vaddr.
+///
+/// ELF: the lowest `PT_LOAD` vaddr (0 for PIE, non-zero for non-PIE).
+/// Mach-O: `__TEXT`'s vmaddr. `__PAGEZERO` is *not* a usable base — it has `vmaddr = 0` but
+/// maps no file content, while a PIE executable's `__TEXT` sits at `0x100000000`. Taking the
+/// minimum over all segments therefore loses `0x100000000` and makes every symbol lookup in
+/// the main executable miss.
+fn link_base(file: &object::File) -> u64 {
+    match file.format() {
+        object::BinaryFormat::MachO => file
+            .segments()
+            // `ObjectSegment::name` is `Result<Option<&str>>` in object 0.36.
+            .find(|s| s.name().ok().flatten() == Some("__TEXT"))
+            .map(|s| s.address())
+            .unwrap_or(0),
+        _ => file.segments().map(|s| s.address()).min().unwrap_or(0),
+    }
+}
+
 /// Parsed symbols from a single binary/library
 struct BinarySymbols {
     /// Sorted by address for efficient lookup: (address, name)
     symbols: Vec<(u64, String)>,
-    /// Lowest loadable segment vaddr (the file's link base; 0 for PIE).
-    min_vaddr: u64,
+    /// The file's link-time base vaddr (see [`link_base`]).
+    link_base: u64,
 }
 
 impl BinarySymbols {
@@ -109,17 +137,23 @@ impl BinarySymbols {
         symbols.sort_by_key(|&(addr, _)| addr);
         symbols.dedup_by_key(|s| s.0);
 
-        let min_vaddr = file.segments().map(|s| s.address()).min().unwrap_or(0);
+        let base = link_base(&file);
 
         debug!("Loaded {} symbols from {}", symbols.len(), path);
 
-        Some(Self { symbols, min_vaddr })
+        Some(Self {
+            symbols,
+            link_base: base,
+        })
     }
-    
+
     /// Find the symbol containing the given offset
     fn lookup(&self, offset: u64) -> Option<&str> {
         // Binary search for the largest address <= offset
-        match self.symbols.binary_search_by_key(&offset, |&(addr, _)| addr) {
+        match self
+            .symbols
+            .binary_search_by_key(&offset, |&(addr, _)| addr)
+        {
             Ok(i) => Some(&self.symbols[i].1),
             Err(0) => None,
             Err(i) => Some(&self.symbols[i - 1].1),
@@ -154,16 +188,16 @@ impl SymbolResolver {
                 return Some(name.clone());
             }
         }
-        
+
         // Resolve via memory maps + symbol table
         let name = self.lookup_symbol(addr);
-        
+
         // Cache the result
         if let Some(ref name) = name {
             let mut cache = self.cache.lock().unwrap();
             cache.insert(addr, name.clone());
         }
-        
+
         name
     }
 
@@ -208,10 +242,10 @@ impl SymbolResolver {
 
         if let Some(ref syms) = symbols {
             // Translate the runtime address back to a file vaddr:
-            //   vaddr = addr - load_base + min_vaddr
+            //   vaddr = addr - load_base + link_base
             let file_vaddr = (addr as u64)
                 .wrapping_sub(load_base as u64)
-                .wrapping_add(syms.min_vaddr);
+                .wrapping_add(syms.link_base);
             if let Some(name) = syms.lookup(file_vaddr) {
                 return Some(name.to_string());
             }
@@ -221,17 +255,12 @@ impl SymbolResolver {
         Some(format!("{}+0x{:x}", filename, addr - load_base))
     }
 
-    /// Resolve multiple addresses efficiently
-    pub fn resolve_batch(&self, addrs: &[usize]) -> Vec<Option<String>> {
-        addrs.iter().map(|&addr| self.resolve_c_function(addr)).collect()
-    }
-
     /// Pre-populate the cache by loading symbols from proc-maps
     pub fn preload(&self) {
         if let Ok(maps) = proc_maps::get_process_maps(self.pid as proc_maps::Pid) {
             let mut binary_cache = self.binary_symbols.lock().unwrap();
             let mut seen = std::collections::HashSet::new();
-            
+
             for map in &maps {
                 if let Some(path) = map.filename() {
                     let path_str = path.to_string_lossy().to_string();
@@ -250,10 +279,68 @@ impl SymbolResolver {
 mod tests {
     use super::*;
 
+    fn current_binary() -> object::File<'static> {
+        // The test binary itself is a real ELF / Mach-O file to parse.
+        let path = std::env::current_exe().expect("test binary path");
+        let data = std::fs::read(path).expect("read test binary");
+        let leaked: &'static [u8] = Box::leak(data.into_boxed_slice());
+        object::File::parse(leaked).expect("parse test binary")
+    }
+
     #[test]
     fn test_resolver_creation() {
         let resolver = SymbolResolver::new(1);
         // Just verify it creates without panic
         assert_eq!(resolver.pid, 1);
+    }
+
+    /// Regression: `__PAGEZERO` (`vmaddr = 0`, no file content) used to be picked as the
+    /// Mach-O link base, which shifted every main-executable lookup by `0x100000000`.
+    #[test]
+    fn test_link_base_excludes_pagezero() {
+        let file = current_binary();
+        let base = link_base(&file);
+
+        #[cfg(target_os = "macos")]
+        assert_eq!(
+            base, 0x1_0000_0000,
+            "Mach-O link base must be __TEXT's vmaddr"
+        );
+
+        #[cfg(target_os = "linux")]
+        assert!(
+            base < 0x1000_0000,
+            "ELF link base is a PT_LOAD vaddr, got 0x{:x}",
+            base
+        );
+    }
+
+    /// Mach-O stores C symbols with a leading underscore, so a raw `"H"` comparison never
+    /// matches and skynet detection silently degrades to single-VM mode.
+    #[test]
+    fn test_link_name_handles_macho_underscore() {
+        let file = current_binary();
+        let name = link_name(&file, "H");
+
+        if file.format() == object::BinaryFormat::MachO {
+            assert_eq!(name, "_H");
+        } else {
+            assert_eq!(name, "H");
+        }
+    }
+
+    /// The two directions of the bias math must be exact inverses for the same base.
+    #[test]
+    fn test_bias_math_roundtrips() {
+        for (link_base, load_base, sym_vaddr) in [
+            (0u64, 0x5555_5555_0000u64, 0x1234u64),
+            (0x1_0000_0000, 0x1_0000_5000, 0x1_0000_2a30),
+        ] {
+            // runtime = vaddr - link_base + load_base
+            let runtime = sym_vaddr.wrapping_sub(link_base).wrapping_add(load_base);
+            // vaddr = runtime - load_base + link_base
+            let back = runtime.wrapping_sub(load_base).wrapping_add(link_base);
+            assert_eq!(back, sym_vaddr);
+        }
     }
 }

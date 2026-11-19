@@ -14,10 +14,14 @@ use crate::error::{Result, TracemoonError};
 use crate::lua::{LuaLayout, LuaVersion, StackFrame, StackWalker};
 use crate::output::{Aggregator, CollapsedOutput};
 use crate::process::{
-    create_reader, detect_lua_version, LuaStateDiscovery, NativeUnwinder, ProcessMemoryReader,
-    SkynetDiscovery, SpawnedChild,
+    create_reader, detect_lua_version, process_exists, LuaStateDiscovery, NativeUnwinder,
+    ProcessMemoryReader, SkynetDiscovery, SpawnedChild,
 };
 use crate::symbols::SymbolResolver;
+
+/// While the Lua version is still unconfirmed, re-run detection at most this often. Each
+/// detection pass reads the target's mapped binaries from disk, so it must not run per tick.
+const VERSION_REDETECT_INTERVAL: Duration = Duration::from_millis(500);
 
 /// Profiling target: attach to an existing PID, or a child we spawned and control.
 pub enum Target {
@@ -50,7 +54,17 @@ pub struct Sampler {
     target: Target,
     config: Config,
     reader: Box<dyn ProcessMemoryReader>,
-    layout: LuaLayout,
+    /// Memory layout of the target's Lua version.
+    ///
+    /// A `Cell` because the version may only be confirmable *after* sampling starts: in
+    /// spawn mode the child is frozen at `execve`, so a dynamically linked Lua is not
+    /// mapped yet and detection has nothing to read. Until a VM walks successfully we keep
+    /// re-detecting; after that — or when `--lua-version` was given — the layout is fixed.
+    layout: Cell<LuaLayout>,
+    /// True when `layout` must not be re-detected or replaced.
+    layout_fixed: Cell<bool>,
+    /// Throttles [`Sampler::refresh_layout`].
+    last_detect: Cell<Option<Instant>>,
     mode: Mode,
     /// Native C-stack unwinder (single-VM mode only; `None` in skynet mode or on
     /// unsupported platforms). Reused across ticks to avoid rebuilding the unwind state.
@@ -70,16 +84,20 @@ impl Sampler {
         // Create memory reader
         let reader = create_reader(pid)?;
 
-        // Pick the Lua layout: explicit override, else auto-detect, else 5.4.
-        let version = config
-            .lua_version
-            .or_else(|| detect_lua_version(pid))
-            .unwrap_or_else(|| {
-                warn!("Could not detect Lua version; defaulting to 5.4");
-                LuaVersion::Lua54
-            });
-        info!("Using Lua {} memory layout", version);
-        let layout = LuaLayout::for_version(version);
+        // Pick the Lua layout: explicit override, else auto-detect. Detection may
+        // legitimately fail here (spawn mode stops the child before the loader runs), in
+        // which case we start from 5.4 and keep re-detecting until a VM confirms it.
+        let (layout, layout_fixed) = match config.lua_version {
+            Some(v) => (LuaLayout::for_version(v), true),
+            None => match detect_lua_version(pid) {
+                Some(v) => (LuaLayout::for_version(v), true),
+                None => {
+                    warn!("Lua version not detectable yet; assuming 5.4 until a VM is found");
+                    (LuaLayout::for_version(LuaVersion::Lua54), false)
+                }
+            },
+        };
+        info!("Using Lua {} memory layout", layout.version);
 
         // Choose mode: skynet multi-VM if the `H` symbol resolves, else single.
         // Single-VM discovery is deferred to the first sample tick (the lua_State may not
@@ -107,7 +125,9 @@ impl Sampler {
             target,
             config,
             reader,
-            layout,
+            layout: Cell::new(layout),
+            layout_fixed: Cell::new(layout_fixed),
+            last_detect: Cell::new(None),
             mode,
             native_unwinder,
             symbol_resolver,
@@ -152,12 +172,9 @@ impl Sampler {
             None
         };
 
-        let mut consecutive_failures = 0;
-        const MAX_CONSECUTIVE_FAILURES: u32 = 10;
-
         // Live `top` view refreshes on this cadence.
         let render_interval = Duration::from_secs(1);
-        let mut last_render = Instant::now() - render_interval;
+        let mut last_render: Option<Instant> = None;
 
         while self.running.load(Ordering::Relaxed) {
             let sample_start = Instant::now();
@@ -178,41 +195,37 @@ impl Sampler {
                 }
             }
 
+            // Attach mode has no waitpid to lean on: the default duration is unlimited, so
+            // a target that exits must be noticed explicitly or the loop spins forever on
+            // failed reads. (The reader cannot report it — it only maps a pid to a handle.)
+            if let Target::Attach(pid) = &self.target {
+                if !process_exists(*pid) {
+                    info!("Target process exited");
+                    break;
+                }
+            }
+
             // Take a sample
             match self.sample() {
-                Ok(stacks) => {
-                    if stacks.is_empty() {
-                        self.aggregator.add_failed();
-                    } else {
-                        for frames in stacks {
-                            self.aggregator.add(frames);
-                        }
-                    }
-                    consecutive_failures = 0;
-                }
+                Ok(stacks) => self.aggregator.add_tick(stacks),
                 Err(TracemoonError::ProcessExited) => {
                     warn!("Target process exited");
                     break;
                 }
                 Err(e) => {
+                    // A single failed sample is normal: we read a running process without
+                    // stopping it, so torn reads happen. Keep going.
                     debug!("Sample failed: {:?}", e);
                     self.aggregator.add_failed();
-                    consecutive_failures += 1;
-
-                    if consecutive_failures >= MAX_CONSECUTIVE_FAILURES {
-                        warn!(
-                            "Too many consecutive failures ({}), continuing anyway",
-                            consecutive_failures
-                        );
-                        consecutive_failures = 0;
-                    }
                 }
             }
 
             // Live `top` rendering.
-            if self.config.mode == RunMode::Top && last_render.elapsed() >= render_interval {
+            if self.config.mode == RunMode::Top
+                && last_render.is_none_or(|t| t.elapsed() >= render_interval)
+            {
                 self.render_top();
-                last_render = Instant::now();
+                last_render = Some(Instant::now());
             }
 
             // Sleep until next sample
@@ -269,16 +282,23 @@ impl Sampler {
     }
 
     /// Take a single sample, returning zero or more stacks to aggregate.
+    ///
+    /// An empty vector means "nothing usable this tick" (typically: the VM does not exist
+    /// yet, in spawn mode); a non-empty vector may still hold empty stacks when the walk
+    /// itself produced no frames.
     fn sample(&self) -> Result<Vec<Vec<StackFrame>>> {
         match &self.mode {
             Mode::Single { addr } => {
                 // Lazily discover the lua_State (spawn mode: it may not exist yet).
                 let mut lua_state_addr = addr.get();
                 if lua_state_addr == 0 {
-                    match self.discover_single_vm() {
+                    self.refresh_layout();
+                    match self.discover_single_vm(&self.layout.get()) {
                         Some(found) => {
                             info!("single-VM mode: lua_State at 0x{:x}", found);
                             addr.set(found);
+                            // A successful walk confirms the layout: stop re-detecting.
+                            self.layout_fixed.set(true);
                             lua_state_addr = found;
                         }
                         None => return Ok(Vec::new()), // retry next tick
@@ -290,21 +310,54 @@ impl Sampler {
         }
     }
 
+    /// Re-detect the target's Lua version while the layout is still unconfirmed.
+    ///
+    /// Exec-stop spawn profiling begins before `ld.so` maps the interpreter, so a
+    /// dynamically linked Lua is invisible to [`detect_lua_version`] at construction. This
+    /// is what keeps such a target from being profiled with 5.4 offsets forever.
+    fn refresh_layout(&self) {
+        if self.layout_fixed.get() {
+            return;
+        }
+
+        let now = Instant::now();
+        let due = self
+            .last_detect
+            .get()
+            .is_none_or(|last| now.duration_since(last) >= VERSION_REDETECT_INTERVAL);
+        if !due {
+            return;
+        }
+        self.last_detect.set(Some(now));
+
+        if let Some(version) = detect_lua_version(self.pid()) {
+            let detected = LuaLayout::for_version(version);
+            if detected.version != self.layout.get().version {
+                info!(
+                    "Detected Lua {} after start-up; switching memory layout",
+                    version
+                );
+                self.layout.set(detected);
+            }
+        }
+    }
+
     /// Discover the single plain-Lua VM. Among all scan candidates, pick the first whose
     /// stack actually walks to a non-empty result — the loose `tt==thread` scan alone
     /// yields many false positives, especially early in a spawned process's life.
-    fn discover_single_vm(&self) -> Option<usize> {
-        let discovery = LuaStateDiscovery::new(self.reader.as_ref(), &self.layout, self.pid());
+    fn discover_single_vm(&self, layout: &LuaLayout) -> Option<usize> {
+        let discovery = LuaStateDiscovery::new(self.reader.as_ref(), layout, self.pid());
         let candidates = discovery.find_all().unwrap_or_default();
-        let walker = StackWalker::new(self.reader.as_ref(), &self.layout);
-        candidates.into_iter().find(|&addr| {
-            matches!(walker.walk(addr), Ok(frames) if !frames.is_empty())
-        })
+        let walker = StackWalker::new(self.reader.as_ref(), layout);
+        candidates
+            .into_iter()
+            .find(|&addr| matches!(walker.walk(addr), Ok(frames) if !frames.is_empty()))
     }
 
     /// Sample a single VM, merging native (C) context with the Lua stack.
     fn sample_single(&self, lua_state_addr: usize) -> Result<Vec<StackFrame>> {
-        let walker = StackWalker::new(self.reader.as_ref(), &self.layout);
+        let layout = self.layout.get();
+        let walker = StackWalker::new(self.reader.as_ref(), &layout);
         let mut lua_frames = walker.walk(lua_state_addr)?;
 
         // Resolve C function symbols for Lua frames
@@ -360,17 +413,21 @@ impl Sampler {
     /// `[service:name]` root frame. Native merging is skipped: a ptrace
     /// register snapshot maps to one worker thread, not to a specific VM.
     fn sample_skynet(&self, h_addr: usize) -> Result<Vec<Vec<StackFrame>>> {
-        let disc = SkynetDiscovery::new(self.reader.as_ref(), &self.layout, h_addr);
+        let layout = self.layout.get();
+        let disc = SkynetDiscovery::new(self.reader.as_ref(), &layout, h_addr);
         let vms = disc.enumerate()?;
 
-        let walker = StackWalker::new(self.reader.as_ref(), &self.layout);
+        let walker = StackWalker::new(self.reader.as_ref(), &layout);
         let mut stacks = Vec::new();
 
         for vm in vms {
             let mut lua_frames = match walker.walk(vm.lua_state_addr) {
                 Ok(f) => f,
                 Err(e) => {
-                    debug!("walk failed for {} @ 0x{:x}: {:?}", vm.label, vm.lua_state_addr, e);
+                    debug!(
+                        "walk failed for {} @ 0x{:x}: {:?}",
+                        vm.label, vm.lua_state_addr, e
+                    );
                     continue;
                 }
             };
@@ -411,14 +468,11 @@ impl Sampler {
             info!("Output written to {}", output_path);
         }
 
-        output.write_stats_stderr(duration).map_err(TracemoonError::Io)?;
+        output
+            .write_stats_stderr(duration)
+            .map_err(TracemoonError::Io)?;
 
         Ok(())
-    }
-
-    /// Get the aggregator (for testing)
-    pub fn aggregator(&self) -> &Aggregator {
-        &self.aggregator
     }
 }
 
@@ -467,7 +521,10 @@ pub fn run_profiler_spawn(argv: Vec<String>, mut config: Config) -> Result<()> {
 }
 
 /// Build a sampler for either an attach PID or a spawned command.
-fn build_target(pid: Option<Pid>, argv: Option<Vec<String>>) -> Result<(Target, Option<Vec<String>>)> {
+fn build_target(
+    pid: Option<Pid>,
+    argv: Option<Vec<String>>,
+) -> Result<(Target, Option<Vec<String>>)> {
     match (pid, argv) {
         (Some(pid), None) => Ok((Target::Attach(pid), None)),
         (None, Some(argv)) => {
@@ -521,6 +578,12 @@ pub fn run_dump(pid: Option<Pid>, argv: Option<Vec<String>>, mut config: Config)
     }
 
     sampler.terminate_child();
+
+    // An empty snapshot means no lua_State was ever found: report the actionable error
+    // instead of printing an empty (and misleadingly successful) dump.
+    if stacks.is_empty() {
+        return Err(TracemoonError::LuaStateNotFound);
+    }
 
     let out = crate::output::dump::format(&stacks, &sampler.target_label(), sampler.pid());
     print!("{}", out);

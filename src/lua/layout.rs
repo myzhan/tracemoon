@@ -13,7 +13,12 @@ use std::str::FromStr;
 
 use crate::error::{Result, TracemoonError};
 use crate::lua::types::{LUA_TSTRING, LUA_TTHREAD};
+use crate::process::reader::validate_addr;
 use crate::process::{read_struct, ProcessMemoryReader};
+
+/// Upper bound on the bytes we will read for one Lua string (source file name, upvalue
+/// name). Any longer value is a corrupt/stale length field, not a real string.
+pub const MAX_LUA_STRING_LEN: usize = 4096;
 
 /// A supported Lua version (memory-layout family).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -54,6 +59,12 @@ impl FromStr for LuaVersion {
 /// Describes the memory layout of a specific Lua version's internal structs.
 ///
 /// All fields are byte offsets/sizes for 64-bit targets.
+///
+/// A few fields are documentation-only: they record a 5.4↔5.5 difference that the walker
+/// currently sidesteps (C-vs-Lua is decoded from the function's TValue tag rather than from
+/// `callstatus`), and are asserted in tests instead of read on the hot path. Keeping them
+/// here is what makes this struct the single place where version differences live.
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy)]
 pub struct LuaLayout {
     pub version: LuaVersion,
@@ -205,24 +216,33 @@ impl LuaLayout {
 
     // --- lua_State readers ---
 
+    /// `base + offset` for remote addresses.
+    ///
+    /// Saturating on purpose: base pointers come out of a live process and can be
+    /// half-written garbage (all-ones is common), which would panic a plain `+` in debug
+    /// builds. A saturated address simply fails `validate_addr` in the reader.
+    fn at(&self, base: usize, offset: usize) -> usize {
+        base.saturating_add(offset)
+    }
+
     pub fn state_tt(&self, r: &dyn ProcessMemoryReader, addr: usize) -> Result<u8> {
-        read_struct::<u8>(r, addr + self.ls_tt)
+        read_struct::<u8>(r, self.at(addr, self.ls_tt))
     }
 
     pub fn state_status(&self, r: &dyn ProcessMemoryReader, addr: usize) -> Result<u8> {
-        read_struct::<u8>(r, addr + self.ls_status)
+        read_struct::<u8>(r, self.at(addr, self.ls_status))
     }
 
     pub fn state_ci(&self, r: &dyn ProcessMemoryReader, addr: usize) -> Result<usize> {
-        Ok(read_struct::<u64>(r, addr + self.ls_ci)? as usize)
+        Ok(read_struct::<u64>(r, self.at(addr, self.ls_ci))? as usize)
     }
 
     pub fn state_stack(&self, r: &dyn ProcessMemoryReader, addr: usize) -> Result<usize> {
-        Ok(read_struct::<u64>(r, addr + self.ls_stack)? as usize)
+        Ok(read_struct::<u64>(r, self.at(addr, self.ls_stack))? as usize)
     }
 
     pub fn base_ci_addr(&self, state_addr: usize) -> usize {
-        state_addr + self.ls_base_ci
+        self.at(state_addr, self.ls_base_ci)
     }
 
     /// Lightweight validity check usable for discovery scanning.
@@ -246,25 +266,25 @@ impl LuaLayout {
     // --- CallInfo readers ---
 
     pub fn ci_previous(&self, r: &dyn ProcessMemoryReader, ci: usize) -> Result<usize> {
-        Ok(read_struct::<u64>(r, ci + self.ci_previous)? as usize)
+        Ok(read_struct::<u64>(r, self.at(ci, self.ci_previous))? as usize)
     }
 
     pub fn ci_savedpc(&self, r: &dyn ProcessMemoryReader, ci: usize) -> Result<usize> {
-        Ok(read_struct::<u64>(r, ci + self.ci_savedpc)? as usize)
-    }
-
-    pub fn ci_is_c(&self, r: &dyn ProcessMemoryReader, ci: usize) -> Result<bool> {
-        let status = if self.callstatus_is_u32 {
-            read_struct::<u32>(r, ci + self.ci_callstatus)?
-        } else {
-            read_struct::<u16>(r, ci + self.ci_callstatus)? as u32
-        };
-        Ok(status & self.cist_c_mask != 0)
+        Ok(read_struct::<u64>(r, self.at(ci, self.ci_savedpc))? as usize)
     }
 
     /// Resolve the address of the function-slot TValue for a CallInfo.
-    pub fn func_slot_addr(&self, r: &dyn ProcessMemoryReader, ci: usize, stack_base: usize) -> Result<usize> {
-        let func = read_struct::<i64>(r, ci + self.ci_func)?;
+    ///
+    /// `stk_is_pointer` is a per-version fact (5.4 stores a stack-relative index that may
+    /// also be an absolute pointer; 5.5 always stores an absolute pointer), never a
+    /// platform fact.
+    pub fn func_slot_addr(
+        &self,
+        r: &dyn ProcessMemoryReader,
+        ci: usize,
+        stack_base: usize,
+    ) -> Result<usize> {
+        let func = read_struct::<i64>(r, self.at(ci, self.ci_func))?;
         if self.stk_is_pointer {
             return Ok(func as usize);
         }
@@ -273,7 +293,7 @@ impl LuaLayout {
         if func_val > 0x10000 && func_val > stack_base / 2 {
             Ok(func_val)
         } else {
-            Ok(stack_base + (func as usize) * self.stackvalue_size)
+            Ok(stack_base.saturating_add(func_val.saturating_mul(self.stackvalue_size)))
         }
     }
 
@@ -285,28 +305,30 @@ impl LuaLayout {
         if ts_addr == 0 {
             return Ok(String::new());
         }
-        let tt = read_struct::<u8>(r, ts_addr + self.ts_tt)?;
+        let tt = read_struct::<u8>(r, self.at(ts_addr, self.ts_tt))?;
         if tt & 0x0F != LUA_TSTRING {
             return Ok(String::new());
         }
         let is_short = (tt & 0x30) == 0;
 
         let (len, data_addr) = if is_short {
-            let len = read_struct::<u8>(r, ts_addr + self.ts_shrlen)? as usize;
-            (len, ts_addr + self.ts_short_data)
+            let len = read_struct::<u8>(r, self.at(ts_addr, self.ts_shrlen))? as usize;
+            (len, self.at(ts_addr, self.ts_short_data))
         } else {
-            let len = read_struct::<u64>(r, ts_addr + self.ts_lnglen)? as usize;
+            let len = read_struct::<u64>(r, self.at(ts_addr, self.ts_lnglen))? as usize;
             let data_addr = if self.ts_long_is_pointer {
-                read_struct::<u64>(r, ts_addr + self.ts_long_data)? as usize
+                read_struct::<u64>(r, self.at(ts_addr, self.ts_long_data))? as usize
             } else {
-                ts_addr + self.ts_long_data
+                self.at(ts_addr, self.ts_long_data)
             };
             (len, data_addr)
         };
 
-        if len == 0 || len > 4096 || data_addr == 0 {
+        // Bound before allocating: `len` is a field of untrusted remote memory.
+        if len == 0 || len > MAX_LUA_STRING_LEN {
             return Ok(String::new());
         }
+        validate_addr(data_addr, len)?;
 
         let bytes = r.read_memory(data_addr, len)?;
         let s = String::from_utf8_lossy(&bytes).to_string();
@@ -318,6 +340,7 @@ impl LuaLayout {
 mod tests {
     use super::*;
     use crate::lua::types::{CallInfo, LClosure, LuaState, Proto, TString, TValue, Upvaldesc};
+    use crate::process::reader::testing::WindowReader;
     use std::mem::{offset_of, size_of};
 
     #[test]
@@ -377,5 +400,33 @@ mod tests {
         assert_eq!("5.4".parse::<LuaVersion>().unwrap(), LuaVersion::Lua54);
         assert_eq!("5.5".parse::<LuaVersion>().unwrap(), LuaVersion::Lua55);
         assert!("6.0".parse::<LuaVersion>().is_err());
+    }
+
+    #[test]
+    fn read_lua_string_strips_the_file_marker() {
+        let l = LuaLayout::for_version(LuaVersion::Lua54);
+        let ts = 0x1000;
+        let mut reader = WindowReader::new(ts, 64);
+
+        reader.write_u8(ts + l.ts_tt, crate::lua::types::LUA_TSTRING);
+        reader.write_u8(ts + l.ts_shrlen, 6);
+        reader.write(ts + l.ts_short_data, b"@a.lua");
+
+        assert_eq!(l.read_lua_string(&reader, ts).unwrap(), "a.lua");
+    }
+
+    /// A corrupt long-string length is untrusted input: reading it verbatim would allocate
+    /// and read up to 2^64 bytes.
+    #[test]
+    fn read_lua_string_caps_absurd_lengths() {
+        let l = LuaLayout::for_version(LuaVersion::Lua54);
+        let ts = 0x1000;
+        let mut reader = WindowReader::new(ts, 64);
+
+        reader.write_u8(ts + l.ts_tt, crate::lua::types::LUA_VLNGSTR);
+        reader.write_u64(ts + l.ts_lnglen, (MAX_LUA_STRING_LEN + 1) as u64);
+        reader.write_u64(ts + l.ts_long_data, ts as u64 + 32);
+
+        assert_eq!(l.read_lua_string(&reader, ts).unwrap(), "");
     }
 }

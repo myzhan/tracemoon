@@ -21,9 +21,6 @@ pub enum TracemoonError {
     #[error("Invalid lua_State structure at address 0x{addr:x}")]
     InvalidLuaState { addr: usize },
 
-    #[error("Failed to resolve symbol: {name}")]
-    SymbolResolutionFailed { name: String },
-
     #[error("Stack walk exceeded maximum depth ({max_depth})")]
     MaxStackDepthExceeded { max_depth: usize },
 

@@ -10,7 +10,10 @@
 use std::process::Command;
 use std::time::{Duration, Instant};
 
-use log::{debug, info, warn};
+use log::{info, warn};
+// Only the exec-stop / ptrace-detach logging is Linux-specific.
+#[cfg(target_os = "linux")]
+use log::debug;
 use nix::sys::signal::{kill, Signal};
 use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
 use nix::unistd::Pid as NixPid;
@@ -22,6 +25,11 @@ use crate::error::{Result, TracemoonError};
 ///
 /// On Linux the child is left stopped at its exec boundary after `spawn`; call
 /// [`SpawnedChild::resume`] to let it run once the sampler is ready.
+///
+/// The handle is a lifecycle owner: dropping it terminates and reaps a still-running child.
+/// That covers every early-return path in the caller (a failed `Sampler::new`, a failing
+/// signal-handler install, a `spawn` that never reaches its exec-stop) without each of them
+/// having to remember to clean up — otherwise tracemoon leaves an orphaned target behind.
 pub struct SpawnedChild {
     pid: Pid,
 }
@@ -51,15 +59,21 @@ impl SpawnedChild {
             }
         }
 
-        let child = cmd.spawn().map_err(|e| {
-            TracemoonError::Other(format!("Failed to spawn '{}': {}", argv[0], e))
-        })?;
+        let child = cmd
+            .spawn()
+            .map_err(|e| TracemoonError::Other(format!("Failed to spawn '{}': {}", argv[0], e)))?;
         let pid = child.id() as Pid;
-        // Leak the std Child handle so the kernel keeps us as the parent; we reap the
-        // child ourselves via waitpid so exit status stays available after detach.
-        std::mem::forget(child);
+
+        // `std::process::Child` has no Drop impl (dropping it neither waits nor kills), so
+        // releasing the handle keeps us the parent without losing the ability to reap the
+        // child ourselves via `waitpid` — which is what keeps the exit status available
+        // after the ptrace detach.
+        drop(child);
 
         info!("Spawned child process {} ({})", pid, argv.join(" "));
+
+        // From here on the child is ours to clean up, including on the error paths below.
+        let spawned = Self { pid };
 
         #[cfg(target_os = "linux")]
         {
@@ -72,12 +86,14 @@ impl SpawnedChild {
                     warn!("Child {} stopped with unexpected signal {:?}", pid, sig);
                 }
                 Ok(status) => {
+                    spawned.terminate();
                     return Err(TracemoonError::Other(format!(
                         "Child {} did not reach exec-stop: {:?}",
                         pid, status
                     )));
                 }
                 Err(e) => {
+                    spawned.terminate();
                     return Err(TracemoonError::Other(format!(
                         "waitpid failed for child {}: {}",
                         pid, e
@@ -86,7 +102,7 @@ impl SpawnedChild {
             }
         }
 
-        Ok(Self { pid })
+        Ok(spawned)
     }
 
     /// PID of the spawned child.
@@ -118,6 +134,8 @@ impl SpawnedChild {
     }
 
     /// Terminate the child if it is still alive: SIGTERM, then SIGKILL if it lingers.
+    ///
+    /// Idempotent: a child that already exited is only reaped.
     pub fn terminate(&self) {
         if self.has_exited() {
             return;
@@ -136,8 +154,32 @@ impl SpawnedChild {
             std::thread::sleep(Duration::from_millis(20));
         }
 
-        warn!("Child {} did not exit after SIGTERM; sending SIGKILL", self.pid);
+        warn!(
+            "Child {} did not exit after SIGTERM; sending SIGKILL",
+            self.pid
+        );
         let _ = kill(nix_pid, Signal::SIGKILL);
         let _ = waitpid(nix_pid, None);
+    }
+}
+
+impl Drop for SpawnedChild {
+    fn drop(&mut self) {
+        // Never panic here: this runs on error paths, including during unwind.
+        self.terminate();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A `SpawnedChild` for a pid that is already gone must be a no-op on drop.
+    #[cfg(unix)]
+    #[test]
+    fn test_terminate_is_idempotent_for_dead_process() {
+        let child = SpawnedChild { pid: i32::MAX };
+        child.terminate();
+        child.terminate();
     }
 }

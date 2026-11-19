@@ -2,7 +2,7 @@
 
 use std::collections::HashSet;
 
-use log::{debug, info};
+use log::debug;
 use remoteprocess::Pid;
 
 use crate::error::{Result, TracemoonError};
@@ -24,15 +24,6 @@ impl<'a> LuaStateDiscovery<'a> {
             layout,
             pid,
         }
-    }
-
-    /// Find a single lua_State address (first scan match).
-    pub fn find(&self) -> Result<usize> {
-        info!("Searching for lua_State in process {}", self.pid);
-        self.find_all()?
-            .into_iter()
-            .next()
-            .ok_or(TracemoonError::LuaStateNotFound)
     }
 
     /// Find every plausible lua_State address by scanning writable regions.
@@ -121,9 +112,7 @@ fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     if needle.is_empty() || haystack.len() < needle.len() {
         return None;
     }
-    haystack
-        .windows(needle.len())
-        .position(|w| w == needle)
+    haystack.windows(needle.len()).position(|w| w == needle)
 }
 
 #[cfg(test)]

@@ -1,6 +1,6 @@
 pub mod discovery;
-pub mod reader;
 pub mod native_stack;
+pub mod reader;
 pub mod skynet;
 pub mod spawn;
 
@@ -11,13 +11,40 @@ pub mod linux;
 pub mod macos;
 
 pub use discovery::{detect_lua_version, LuaStateDiscovery};
-pub use reader::{ProcessMemoryReader, read_struct, read_pointer, read_string};
 pub use native_stack::NativeUnwinder;
+pub use reader::{read_string, read_struct, ProcessMemoryReader};
 pub use skynet::SkynetDiscovery;
 pub use spawn::SpawnedChild;
 
 use crate::error::Result;
 use remoteprocess::Pid;
+
+/// Cheap "is this pid still alive" probe.
+///
+/// Attach mode has no `waitpid` to lean on (the target is not our child), so this is how the
+/// sampling loop notices that the process it is profiling has gone away.
+pub fn process_exists(pid: Pid) -> bool {
+    if pid <= 0 {
+        return false;
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        std::path::Path::new(&format!("/proc/{}", pid)).exists()
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        // Signal 0 performs the permission/existence checks without delivering anything.
+        unsafe { libc::kill(pid, 0) == 0 }
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = pid;
+        true
+    }
+}
 
 /// Create a platform-specific process memory reader
 pub fn create_reader(pid: Pid) -> Result<Box<dyn ProcessMemoryReader>> {
@@ -34,7 +61,7 @@ pub fn create_reader(pid: Pid) -> Result<Box<dyn ProcessMemoryReader>> {
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
         Err(crate::error::TracemoonError::Other(
-            "Unsupported platform".to_string()
+            "Unsupported platform".to_string(),
         ))
     }
 }

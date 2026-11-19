@@ -115,12 +115,21 @@ impl Config {
 
         // PID (optional; attach path)
         if let Some(pid_str) = sub_matches.value_of("pid") {
-            config.pid = Some(pid_str.parse().map_err(|_| {
+            let pid: i32 = pid_str.parse().map_err(|_| {
                 clap::Error::raw(
                     clap::ErrorKind::InvalidValue,
                     format!("Invalid PID '{}': must be a positive integer\n", pid_str),
                 )
-            })?);
+            })?;
+            // `parse::<i32>()` happily accepts `-1`; a non-positive pid is never a target
+            // (and `kill(0, …)`/`kill(-1, …)` mean "every process in the group").
+            if pid <= 0 {
+                return Err(clap::Error::raw(
+                    clap::ErrorKind::InvalidValue,
+                    format!("Invalid PID '{}': must be a positive integer\n", pid_str),
+                ));
+            }
+            config.pid = Some(pid);
         }
 
         // Sample rate (record/top only; dump has no rate arg)
@@ -318,6 +327,27 @@ mod tests {
         let config = Config::from_args(&args).unwrap();
         assert_eq!(config.pid, Some(5));
         assert_eq!(config.command, None);
+    }
+
+    /// `0` and negative pids are never valid targets (`kill(0, …)` signals the whole
+    /// process group), so the CLI must reject them instead of profiling something else.
+    #[test]
+    fn test_rejects_non_positive_pid() {
+        for pid in ["0", "-7"] {
+            let args = vec![
+                "tracemoon".to_string(),
+                "record".to_string(),
+                "-p".to_string(),
+                pid.to_string(),
+            ];
+
+            let err = Config::from_args(&args).unwrap_err();
+            assert!(
+                err.kind() == clap::ErrorKind::InvalidValue
+                    || err.kind() == clap::ErrorKind::UnknownArgument,
+                "unexpected error for pid {pid}: {err:?}"
+            );
+        }
     }
 
     #[test]

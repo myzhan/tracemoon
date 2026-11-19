@@ -85,7 +85,10 @@ impl<'a> SkynetDiscovery<'a> {
         let name_arr = read_struct::<u64>(r, hs + HS_NAME)? as usize;
 
         if slot < 0x1000 || slot_size == 0 || slot_size > 1_000_000 {
-            debug!("Implausible handle_storage: slot=0x{:x} slot_size={}", slot, slot_size);
+            debug!(
+                "Implausible handle_storage: slot=0x{:x} slot_size={}",
+                slot, slot_size
+            );
             return Ok(Vec::new());
         }
 

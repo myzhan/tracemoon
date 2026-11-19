@@ -65,24 +65,26 @@ pub fn function_stats(stacks: &HashMap<String, u64>) -> Vec<FnStat> {
 /// Render the live top screen (caller is responsible for clearing the terminal first).
 pub fn render(agg: &Aggregator, label: &str, elapsed: f64, max_rows: usize) -> String {
     let mut out = String::new();
-    let successful = agg.successful_samples();
+    // Percentages are per sampled stack, not per tick: in multi-VM mode one tick yields one
+    // stack per service, so a tick-based denominator would push every row past 100%.
+    let sampled = agg.sampled_stacks();
 
     out.push_str(&format!(
         "tracemoon top — {}   ({:.1}s, {} samples, {:.1}% ok)\n",
         label,
         elapsed,
-        agg.total_samples(),
+        sampled,
         agg.success_rate(),
     ));
     out.push_str("Press Ctrl+C to stop.\n\n");
     out.push_str("  %Own   %Total  Function\n");
 
-    if successful == 0 {
+    if sampled == 0 {
         out.push_str("  (waiting for samples…)\n");
         return out;
     }
 
-    let denom = successful as f64;
+    let denom = sampled as f64;
     for stat in function_stats(agg.get_stacks()).into_iter().take(max_rows) {
         let own_pct = (stat.own as f64 / denom) * 100.0;
         let total_pct = (stat.total as f64 / denom) * 100.0;

@@ -19,8 +19,6 @@ use remoteprocess::Pid;
 pub struct NativeFrame {
     /// Instruction pointer (return address)
     pub ip: usize,
-    /// Frame pointer (for debugging)
-    pub fp: usize,
 }
 
 /// Reusable native-stack unwinder for one target process.
@@ -45,14 +43,20 @@ impl NativeUnwinder {
             Some(Self { pid, unwinder })
         }
 
-        #[cfg(all(target_os = "macos", any(target_arch = "x86_64", target_arch = "aarch64")))]
+        #[cfg(all(
+            target_os = "macos",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ))]
         {
             Some(Self { pid })
         }
 
         #[cfg(not(any(
             all(target_os = "linux", target_arch = "x86_64"),
-            all(target_os = "macos", any(target_arch = "x86_64", target_arch = "aarch64"))
+            all(
+                target_os = "macos",
+                any(target_arch = "x86_64", target_arch = "aarch64")
+            )
         )))]
         {
             let _ = pid;
@@ -69,7 +73,10 @@ impl NativeUnwinder {
             self.linux_frames()
         }
 
-        #[cfg(all(target_os = "macos", any(target_arch = "x86_64", target_arch = "aarch64")))]
+        #[cfg(all(
+            target_os = "macos",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ))]
         {
             macos::get_native_frames(nix::unistd::Pid::from_raw(self.pid), reader)
                 .unwrap_or_default()
@@ -77,7 +84,10 @@ impl NativeUnwinder {
 
         #[cfg(not(any(
             all(target_os = "linux", target_arch = "x86_64"),
-            all(target_os = "macos", any(target_arch = "x86_64", target_arch = "aarch64"))
+            all(
+                target_os = "macos",
+                any(target_arch = "x86_64", target_arch = "aarch64")
+            )
         )))]
         {
             let _ = reader;
@@ -123,10 +133,7 @@ impl NativeUnwinder {
         let mut frames = Vec::new();
         for ip in cursor {
             match ip {
-                Ok(ip) => frames.push(NativeFrame {
-                    ip: ip as usize,
-                    fp: 0,
-                }),
+                Ok(ip) => frames.push(NativeFrame { ip: ip as usize }),
                 Err(_) => break,
             }
             if frames.len() >= 128 {
@@ -155,7 +162,7 @@ impl<'a> NativeStackWalker<'a> {
 
         // Add the initial frame
         if initial_ip != 0 {
-            frames.push(NativeFrame { ip: initial_ip, fp: initial_fp });
+            frames.push(NativeFrame { ip: initial_ip });
         }
 
         // Walk frame pointer chain (x86_64 calling convention)
@@ -170,7 +177,7 @@ impl<'a> NativeStackWalker<'a> {
             }
 
             // Validate frame pointer looks reasonable
-            if fp < 0x1000 || fp > 0x7fffffffffff {
+            if !(0x1000..=0x7fff_ffff_ffff).contains(&fp) {
                 break;
             }
 
@@ -182,13 +189,25 @@ impl<'a> NativeStackWalker<'a> {
             };
 
             let saved_fp = u64::from_ne_bytes([
-                frame_data[0], frame_data[1], frame_data[2], frame_data[3],
-                frame_data[4], frame_data[5], frame_data[6], frame_data[7],
+                frame_data[0],
+                frame_data[1],
+                frame_data[2],
+                frame_data[3],
+                frame_data[4],
+                frame_data[5],
+                frame_data[6],
+                frame_data[7],
             ]) as usize;
 
             let return_addr = u64::from_ne_bytes([
-                frame_data[8], frame_data[9], frame_data[10], frame_data[11],
-                frame_data[12], frame_data[13], frame_data[14], frame_data[15],
+                frame_data[8],
+                frame_data[9],
+                frame_data[10],
+                frame_data[11],
+                frame_data[12],
+                frame_data[13],
+                frame_data[14],
+                frame_data[15],
             ]) as usize;
 
             // Validate return address looks like code
@@ -196,10 +215,7 @@ impl<'a> NativeStackWalker<'a> {
                 break;
             }
 
-            frames.push(NativeFrame {
-                ip: return_addr,
-                fp: saved_fp,
-            });
+            frames.push(NativeFrame { ip: return_addr });
 
             // Move to next frame
             if saved_fp <= fp {
@@ -226,40 +242,59 @@ pub mod macos {
 
     const KERN_SUCCESS: KernReturn = 0;
 
-    // x86_64 thread state flavor
+    // x86_64 thread state flavor (only meaningful when built for x86_64)
+    #[cfg(target_arch = "x86_64")]
     const X86_THREAD_STATE64: ThreadState = 4;
+    #[cfg(target_arch = "x86_64")]
     const X86_THREAD_STATE64_COUNT: u32 = 42;
 
     // ARM64 thread state flavor
     const ARM_THREAD_STATE64: ThreadState = 6;
     const ARM_THREAD_STATE64_COUNT: u32 = 68;
 
+    #[cfg(target_arch = "x86_64")]
     #[repr(C)]
     #[derive(Debug, Default)]
     struct X86ThreadState64 {
-        rax: u64, rbx: u64, rcx: u64, rdx: u64,
-        rdi: u64, rsi: u64, rbp: u64, rsp: u64,
-        r8: u64, r9: u64, r10: u64, r11: u64,
-        r12: u64, r13: u64, r14: u64, r15: u64,
-        rip: u64, rflags: u64,
-        cs: u64, fs: u64, gs: u64,
+        rax: u64,
+        rbx: u64,
+        rcx: u64,
+        rdx: u64,
+        rdi: u64,
+        rsi: u64,
+        rbp: u64,
+        rsp: u64,
+        r8: u64,
+        r9: u64,
+        r10: u64,
+        r11: u64,
+        r12: u64,
+        r13: u64,
+        r14: u64,
+        r15: u64,
+        rip: u64,
+        rflags: u64,
+        cs: u64,
+        fs: u64,
+        gs: u64,
     }
 
     #[repr(C)]
     #[derive(Debug, Default)]
     struct Arm64ThreadState {
-        x: [u64; 29],  // x0-x28
-        fp: u64,       // x29 (frame pointer)
-        lr: u64,       // x30 (link register)
-        sp: u64,       // stack pointer
-        pc: u64,       // program counter
-        cpsr: u32,     // current program status register
+        x: [u64; 29], // x0-x28
+        fp: u64,      // x29 (frame pointer)
+        lr: u64,      // x30 (link register)
+        sp: u64,      // stack pointer
+        pc: u64,      // program counter
+        cpsr: u32,    // current program status register
         _pad: u32,
     }
 
     extern "C" {
         fn task_for_pid(target: MachPort, pid: i32, task: *mut MachPort) -> KernReturn;
-        fn task_threads(task: MachPort, threads: *mut *mut MachPort, count: *mut u32) -> KernReturn;
+        fn task_threads(task: MachPort, threads: *mut *mut MachPort, count: *mut u32)
+            -> KernReturn;
         fn thread_get_state(
             thread: MachPort,
             flavor: ThreadState,
@@ -267,9 +302,52 @@ pub mod macos {
             count: *mut u32,
         ) -> KernReturn;
         fn mach_task_self() -> MachPort;
+        fn mach_port_deallocate(task: MachPort, name: MachPort) -> KernReturn;
         fn vm_deallocate(task: MachPort, addr: usize, size: usize) -> KernReturn;
         fn thread_suspend(thread: MachPort) -> KernReturn;
         fn thread_resume(thread: MachPort) -> KernReturn;
+    }
+
+    /// Owns a send-right to the target task, releasing it on drop.
+    ///
+    /// `task_for_pid` hands out a user reference on *every* call, and this runs once per
+    /// sample tick — not releasing it leaks Mach port references at the sampling rate.
+    struct TaskPort(MachPort);
+
+    impl Drop for TaskPort {
+        fn drop(&mut self) {
+            unsafe {
+                mach_port_deallocate(mach_task_self(), self.0);
+            }
+        }
+    }
+
+    /// Owns the thread list returned by `task_threads`.
+    ///
+    /// That call transfers one send-right per returned thread port plus the array itself, so
+    /// both the ports and the array must be given back — deallocating only the array (as this
+    /// code used to) leaks a port reference per thread per tick.
+    struct ThreadPorts {
+        task: MachPort,
+        ptr: *mut MachPort,
+        count: u32,
+    }
+
+    impl Drop for ThreadPorts {
+        fn drop(&mut self) {
+            unsafe {
+                for i in 0..self.count as usize {
+                    mach_port_deallocate(self.task, *self.ptr.add(i));
+                }
+                if !self.ptr.is_null() {
+                    vm_deallocate(
+                        mach_task_self(),
+                        self.ptr as usize,
+                        self.count as usize * mem::size_of::<MachPort>(),
+                    );
+                }
+            }
+        }
     }
 
     /// Get native stack frames for a process on macOS
@@ -284,71 +362,80 @@ pub mod macos {
             if kr != KERN_SUCCESS {
                 return Ok(Vec::new()); // Silently fail, native stack is optional
             }
+            let task = TaskPort(task);
 
             // Get threads
             let mut threads: *mut MachPort = std::ptr::null_mut();
             let mut thread_count: u32 = 0;
-            let kr = task_threads(task, &mut threads, &mut thread_count);
+            let kr = task_threads(task.0, &mut threads, &mut thread_count);
             if kr != KERN_SUCCESS || thread_count == 0 {
+                // `task_threads` may still have handed us an array on failure.
+                if !threads.is_null() {
+                    drop(ThreadPorts {
+                        task: task.0,
+                        ptr: threads,
+                        count: thread_count,
+                    });
+                }
                 return Ok(Vec::new());
             }
+            let thread_ports = ThreadPorts {
+                task: task.0,
+                ptr: threads,
+                count: thread_count,
+            };
 
             let mut all_frames = Vec::new();
 
             // Get state of first thread (main thread)
-            if thread_count > 0 {
-                let thread = *threads;
+            let thread = *thread_ports.ptr;
 
-                // Suspend thread for consistent state
-                thread_suspend(thread);
+            // Suspend thread for consistent state
+            thread_suspend(thread);
 
-                // Try x86_64 first, then ARM64
-                #[cfg(target_arch = "x86_64")]
-                {
-                    let mut state = X86ThreadState64::default();
-                    let mut count = X86_THREAD_STATE64_COUNT;
-                    let kr = thread_get_state(
-                        thread,
-                        X86_THREAD_STATE64,
-                        &mut state as *mut _ as *mut u8,
-                        &mut count,
-                    );
+            // Try x86_64 first, then ARM64
+            #[cfg(target_arch = "x86_64")]
+            {
+                let mut state = X86ThreadState64::default();
+                let mut count = X86_THREAD_STATE64_COUNT;
+                let kr = thread_get_state(
+                    thread,
+                    X86_THREAD_STATE64,
+                    &mut state as *mut _ as *mut u8,
+                    &mut count,
+                );
 
-                    if kr == KERN_SUCCESS {
-                        let walker = NativeStackWalker::new(reader);
-                        if let Ok(frames) = walker.walk(state.rbp as usize, state.rip as usize) {
-                            all_frames = frames;
-                        }
+                if kr == KERN_SUCCESS {
+                    let walker = NativeStackWalker::new(reader);
+                    if let Ok(frames) = walker.walk(state.rbp as usize, state.rip as usize) {
+                        all_frames = frames;
                     }
                 }
-
-                #[cfg(target_arch = "aarch64")]
-                {
-                    let mut state = Arm64ThreadState::default();
-                    let mut count = ARM_THREAD_STATE64_COUNT;
-                    let kr = thread_get_state(
-                        thread,
-                        ARM_THREAD_STATE64,
-                        &mut state as *mut _ as *mut u8,
-                        &mut count,
-                    );
-
-                    if kr == KERN_SUCCESS {
-                        let walker = NativeStackWalker::new(reader);
-                        if let Ok(frames) = walker.walk(state.fp as usize, state.pc as usize) {
-                            all_frames = frames;
-                        }
-                    }
-                }
-
-                // Resume thread
-                thread_resume(thread);
             }
 
-            // Clean up
-            let threads_size = thread_count as usize * mem::size_of::<MachPort>();
-            vm_deallocate(mach_task_self(), threads as usize, threads_size);
+            #[cfg(target_arch = "aarch64")]
+            {
+                let mut state = Arm64ThreadState::default();
+                let mut count = ARM_THREAD_STATE64_COUNT;
+                let kr = thread_get_state(
+                    thread,
+                    ARM_THREAD_STATE64,
+                    &mut state as *mut _ as *mut u8,
+                    &mut count,
+                );
 
+                if kr == KERN_SUCCESS {
+                    let walker = NativeStackWalker::new(reader);
+                    if let Ok(frames) = walker.walk(state.fp as usize, state.pc as usize) {
+                        all_frames = frames;
+                    }
+                }
+            }
+
+            // Resume thread
+            thread_resume(thread);
+
+            // Dropping `thread_ports`/`task` releases the Mach port references.
             Ok(all_frames)
         }
     }
