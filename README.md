@@ -1,5 +1,7 @@
 # tracemoon
 
+[![CI](https://github.com/myzhan/tracemoon/actions/workflows/ci.yml/badge.svg)](https://github.com/myzhan/tracemoon/actions/workflows/ci.yml)
+
 A sampling profiler for Lua 5.4 and 5.5, inspired by [py-spy](https://github.com/benfred/py-spy). Attach to a running Lua process, capture mixed Lua + C call stacks, and generate interactive flamegraph SVGs. It also profiles [skynet](https://github.com/cloudwu/skynet) processes that host many Lua VMs in a single process.
 
 ## Example flamegraphs
@@ -21,8 +23,8 @@ skynet — each service's Lua VM is rendered under its own `[service:name]` root
 - **skynet multi-VM** - enumerates every service's Lua VM and renders each under a `[service:name]` root frame
 - **Mixed stacks** - captures both Lua and native C call stacks, merged together (single-VM mode). On Linux x86_64 the native chain (`luaV_execute → … → main`) is unwound via libunwind; in spawn mode this works without root
 - **Three output modes** - `record` (flamegraph/collapsed file), `dump` (one-shot stack snapshot), and `top` (live hottest-functions view), à la py-spy
-- **Symbol resolution** - resolves C function names from Mach-O/ELF symbol tables
-- **Lua debug info** - extracts source files, line numbers, and function names
+- **Symbol resolution** - resolves C function names from Mach-O/ELF symbol tables (ELF *and* Mach-O load-base math, including `__PAGEZERO` and the Mach-O `_` symbol prefix)
+- **Lua debug info** - extracts the source chunk and current line for every Lua frame; only the main chunk is named (`main`), because Lua records no function names (see [How It Works](#how-it-works))
 - **Flamegraph SVG** - generates interactive flamegraphs directly (via [inferno](https://github.com/jonhoo/inferno))
 - **Cross-platform** - supports Linux and macOS (x86_64 / ARM64)
 
@@ -111,25 +113,29 @@ sudo tracemoon top -p 12345 -r 200
 ```
 
 Because spawn mode makes tracemoon the target's parent, ptrace seize is permitted even under
-`kernel.yama.ptrace_scope=1` — so native C stacks (and `dump`/`top`) work **without root** when
-you spawn the target. Attaching to an existing PID still needs root / `CAP_SYS_PTRACE`.
+`kernel.yama.ptrace_scope=1` — so native C stacks (and `dump`/`top`) work **without root** on
+Linux when you spawn the target. Attaching to an existing PID still needs root /
+`CAP_SYS_PTRACE`. On macOS both modes need root, because `task_for_pid` is what actually
+reads the target (even for a child we spawned).
 
 ## Sample Output
 
 ```
 Sampling statistics:
   Duration: 5.0s
-  Samples collected: 288
-  Successful samples: 288
+  Sampling ticks: 500
+  Successful ticks: 497
+  Failed ticks: 3
+  Success rate: 99.4%
+  Stacks sampled: 497
   Unique stacks: 4
-  Success rate: 100.0%
 
   Top stacks:
-    [33.1%] (95 samples)
+    [33.1%] (165 samples)
       ├─ [C]:pmain
       ├─ tests/lua/multi_func.lua:27:main
-      ├─ tests/lua/multi_func.lua:22:process_data
-      ├─ tests/lua/multi_func.lua:15:compute_heavy
+      ├─ tests/lua/multi_func.lua:22
+      ├─ tests/lua/multi_func.lua:15
       ├─ tests/lua/multi_func.lua:7
       ├─ [C]:math_sin
       ├─ [C]:luaV_execute
@@ -137,12 +143,17 @@ Sampling statistics:
       └─ [C]:main
 ```
 
+Ticks and stacks are counted separately: one tick yields one stack in single-VM mode but one
+stack *per service* in skynet mode, so the success rate is computed over ticks while stack
+percentages use the sampled-stack count. A non-100% rate is healthy — sampling a running
+process means occasionally reading a half-written structure.
+
 ## Requirements
 
-- Rust 1.70+
+- Rust 1.82+
 - Target: Lua 5.4.x / 5.5.x processes (including skynet)
-- **Linux:** root or `CAP_SYS_PTRACE` capability
-- **macOS:** root (`sudo`) required for `task_for_pid`
+- **Linux, attach mode:** root or `CAP_SYS_PTRACE` (spawn mode needs neither)
+- **macOS:** root (`sudo`) required for `task_for_pid`, in both modes
 
 ## How It Works
 
@@ -159,8 +170,12 @@ Sampling statistics:
    - skynet mode prepends a `[service:name]` root frame per VM (native merge is skipped, since a
      ptrace register snapshot maps to one worker thread, not a specific VM)
 5. **Resolve** symbols:
-   - Lua: read `Proto.source` (TString) for filenames, `lineinfo` for line numbers, upvalue names for function names
-   - C: parse Mach-O/ELF symbol tables from mapped binaries
+   - Lua: read `Proto.source` (TString) for the chunk name and `Proto.lineinfo` for the line.
+     Lua stores no function names; `Upvaldesc.name` holds *captured variable* names, so using
+     it would label a function after one of its callees. Only the main chunk
+     (`linedefined == 0`) is named `main`; other frames render as `source:line`.
+   - C: parse Mach-O/ELF symbol tables from mapped binaries (undefined imports excluded,
+     load base taken from the lowest mapping / `__TEXT`)
 6. **Output** aggregated stacks as flamegraph SVG or collapsed text
 
 ## Debug Logging
@@ -174,8 +189,14 @@ sudo RUST_LOG=debug ./target/debug/tracemoon record -p 12345 -d 2
 ```bash
 cargo build           # debug
 cargo build --release # optimized
-cargo test            # run tests
+cargo test            # unit tests (no target process needed)
+cargo clippy --all-targets -- -D warnings
+cargo fmt --check
 ```
+
+CI runs all four on Linux and macOS; the Linux job also launches `lua5.4` in spawn mode and
+asserts the run produced samples, which is the end-to-end check that stack walking, symbol
+resolution and the tick loop still work.
 
 ## License
 
