@@ -1,0 +1,100 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint-and-test:
+    name: fmt + clippy + test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      # `remoteprocess` links against libunwind and liblzma on Linux; the runners
+      # ship the runtime libs but not the unversioned dev symlinks the linker needs.
+      - name: Install native build dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y liblzma-dev libunwind-dev
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: cargo fmt
+        run: cargo fmt --all --check
+
+      - name: cargo clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: cargo test
+        run: cargo test --all-targets
+
+      - name: cargo build --release
+        run: cargo build --release
+
+  smoke:
+    name: spawn-mode smoke test (Lua 5.4)
+    runs-on: ubuntu-latest
+    needs: lint-and-test
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install native build dependencies + lua5.4
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y liblzma-dev libunwind-dev lua5.4
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build release binary
+        run: cargo build --release
+
+      # Spawn mode needs no root/CAP_SYS_PTRACE: the target is our own child, so
+      # process_vm_readv and ptrace seize are always permitted. This is the
+      # end-to-end check that walking/discovery/symbol resolution still work.
+      - name: Record a profile of a spawned Lua process
+        run: |
+          set -euo pipefail
+          ./target/release/tracemoon record -d 3 -o smoke.txt \
+            -- lua5.4 tests/lua/multi_func.lua 2> smoke.stderr
+          echo '--- stderr ---'
+          cat smoke.stderr
+          echo '--- collapsed stacks ---'
+          cat smoke.txt
+
+          test -s smoke.txt
+          # Real Lua frames must appear, named by chunk.
+          grep -q 'multi_func.lua' smoke.txt
+          # The main chunk is the only frame with a name.
+          grep -q 'main' smoke.txt
+          # Regression guard: undefined imported symbols must never be resolved.
+          if grep -qE '\bgetenv\b|gcov' smoke.txt; then
+            echo '::error::undefined/imported symbols leaked into the profile'
+            exit 1
+          fi
+          # Torn reads happen, but a near-zero success rate means discovery locked
+          # onto a false positive lua_State.
+          rate=$(grep -o 'Success rate: [0-9.]*' smoke.stderr | grep -o '[0-9.]*' | head -n1)
+          echo "success rate: ${rate}%"
+          awk -v r="${rate:-0}" 'BEGIN { exit !(r + 0 >= 90) }'
