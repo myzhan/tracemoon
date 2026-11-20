@@ -13,15 +13,21 @@ native C stack (libunwind-ptrace on Linux x86_64), aggregates samples, and emits
 SVG / collapsed stacks (`record`), a one-shot snapshot (`dump`), or a live top view (`top`). It
 has first-class support for **skynet**, which hosts many Lua VMs in one process.
 
+A second subsystem captures **Lua heap ownership** (`mem capture` / `mem report` /
+`mem inspect`): freeze every thread of a 64-bit Linux Lua 5.4 process, copy the object graph,
+resume, then analyse the versioned snapshot offline (including from Linux ELF cores, on
+macOS too). It shares the reader and VM-discovery layer with the sampler and nothing else.
+
 Two targeting modes:
 - **Attach** (`-p PID`): profile an already-running process.
 - **Spawn** (`-- <cmd>`): tracemoon launches the child itself and profiles from `t=0`, so
   startup work isn't missed (see "Spawn mode" below).
 
-Two companion documents: `docs/lua-profiler-ptrace.md` explains how the current machinery
-works, and `docs/roadmap.md` holds the backlog (tiered, with the invariants each planned
-feature has to respect). Read the roadmap before inventing a design for a new feature — the
-constraints and the rejected alternatives are already written down there.
+Three companion documents: `docs/lua-profiler-ptrace.md` explains how the current machinery
+works, `docs/memory-snapshot-design.md` scopes the heap subsystem and its limits, and
+`docs/roadmap.md` holds the backlog (tiered, with the invariants each planned feature has to
+respect). Read the roadmap before inventing a design for a new feature — the constraints and
+the rejected alternatives are already written down there.
 
 ## Build, test, run
 
@@ -67,19 +73,25 @@ walk output).
 ## Architecture / control flow
 
 ```
-main.rs                 CLI dispatch: (pid, command) → attach | spawn | error
- └─ config.rs           clap parsing → Config { pid, command, rate, duration, ... }
- └─ sampler.rs          Sampler: owns Target, reader, layout, Mode, resolver, aggregator
-     ├─ Target          Attach(Pid) | Spawn(SpawnedChild)
-     ├─ Mode            Single { addr: Cell } | Skynet { h_addr }
-     ├─ run()           sample loop @ rate Hz; resumes spawned child; honors duration/Ctrl+C
-     └─ sample()        → walk Lua stack(s) (+ native merge in single mode) → aggregate
+main.rs                 CLI dispatch: (pid, command) → attach | spawn | mem | error
+ ├─ config.rs           clap parsing → Config { mode, pid, command, rate, duration, services }
+ ├─ sampler.rs          Sampler: owns Target, reader, layout, Mode, resolver, aggregator
+ │   ├─ Target          Attach(Pid) | Spawn(SpawnedChild)
+ │   ├─ Mode            Single { addr: Cell } | Skynet { h_addr }
+ │   ├─ run()           sample loop @ rate Hz; resumes spawned child; honors duration/Ctrl+C
+ │   └─ sample()        → walk Lua stack(s) (+ native merge in single mode) → aggregate
+ │
+ └─ memory/mod.rs       `mem capture | mem report | mem inspect`
+     ├─ capture_process()  preflight → freeze → copy → resume → classify → write
+     └─ run()              core::read (ELF core) | snapshot::read (.tmoon) → analyze | html
 ```
 
 Module map:
-- `src/config.rs` — CLI (clap 3.2 builder API), `record` / `dump` / `top` subcommands. Also
-  owns PID validation (`<= 0` is rejected).
-- `src/sampler.rs` — the coordinator. `Target`, `Mode`, the tick loop, output.
+- `src/config.rs` — CLI (clap 3.2 builder API): `record` / `dump` / `top` / `mem`. Owns PID
+  validation (`<= 0` is rejected) and the repeatable `--service` list. `RunMode::Memory`
+  short-circuits before the attach-versus-spawn split.
+- `src/sampler.rs` — the CPU coordinator. `Target`, `Mode`, the tick loop, service filtering,
+  output and the `.meta.json` sidecar.
 - `src/lua/`
   - `layout.rs` — **version-parameterized offset tables** (`LuaLayout`) + all the typed
     field readers. This is where 5.4 vs 5.5 differences live.
@@ -95,10 +107,28 @@ Module map:
   - `linux.rs` / `macos.rs` — platform readers (`process_vm_readv` / `mach_vm_read`).
   - `discovery.rs` — `LuaStateDiscovery` (memory scan for a valid `lua_State`) +
     `detect_lua_version` (scans mapped files' rodata for the `Lua 5.N` string).
-  - `skynet.rs` — `SkynetDiscovery`: walk `H` → slots → `snlua.activeL`, one VM per service.
+  - `skynet.rs` — `SkynetDiscovery`: walk `H` → slots → `snlua.activeL`, one VM per service,
+    plus each VM's handle and registered label (what `--service` matches).
   - `native_stack.rs` — `NativeUnwinder` (Linux x86_64 libunwind-ptrace) + macOS FP walk
     (with RAII `TaskPort` / `ThreadPorts` guards).
+  - `freeze.rs` — `FrozenProcess`: all-thread `ptrace` seize/interrupt for heap capture and
+    an RAII resume that never sends SIGCONT. Linux only; elsewhere `new` is a config error.
   - `spawn.rs` — `SpawnedChild` (spawn/resume/has_exited/terminate) and its `Drop` cleanup.
+- `src/memory/` — the heap-ownership subsystem. Shares the reader, symbol lookup and VM
+  discovery with the sampler; heap decoding uses `HeapLayout`, never the CPU offset tables,
+  and the CPU `Aggregator` is not involved.
+  - `mod.rs` — `mem` CLI → `MemoryCommand`; `capture_process()` orchestrates
+    preflight → freeze → copy → resume → analyse → write.
+  - `layout.rs` — `HeapLayout`: allocation sizes, the four ownership lists, roots. Separate
+    from the CPU layout by design; `skynet54()` is the only ABI fork.
+  - `capture.rs` — `BudgetReader` + VM enumeration (`discover_ranges`, shared with cores) +
+    object/reference decoding into `Snapshot`.
+  - `snapshot.rs` — versioned JSON graph (serde), atomic write, validated read.
+  - `analyze.rs` — strong reachability, bounded large-object ranking, holding paths, the
+    English text report.
+  - `core.rs` — Linux ELF64 core behind the same `ProcessMemoryReader`.
+  - `html.rs` — self-contained Chinese HTML report (`report.js` / `style.css` embedded).
+  - `tests.rs` — decoder tests over allocator-exported heap fixtures.
 - `src/symbols/`
   - `resolver.rs` — ELF/Mach-O symbol resolution (addr → function name) +
     `resolve_symbol_address` (name → runtime addr, used to find skynet's `H`).
@@ -107,6 +137,8 @@ Module map:
   - `aggregator.rs` — tick accounting + counts identical stacks (collapsed-string keyed).
   - `collapsed.rs` — writes collapsed text + inferno flamegraph SVG + stderr stats.
   - `dump.rs` — `dump` mode snapshot formatting.
+  - `metadata.rs` — hand-written `<output>.meta.json` sidecar (version, target, layout
+    confirmation, elapsed, tick denominators).
   - `top.rs` — `top` mode live view rendering.
 - `src/error.rs` — `TracemoonError` enum + `Result` alias.
 
@@ -223,6 +255,25 @@ relevant area.**
   file and verified against skynet's source. C services (no Lua) are skipped via the
   `is_valid_state` check on `activeL`.
 
+### Service filtering (`sampler.rs`)
+- `--service` matches an exact label or a `:xxxxxxxx` handle, is ORed, and is applied per VM
+  before walking. `service_selected` is the only matcher; do not add fuzzy or prefix matching.
+- A selected VM whose walk returns no Lua frames is skipped (`Ok(f) if f.is_empty() =>
+  continue`), not promoted to a synthetic `[service:…]`-root success. Without that guard,
+  filtering to one idle service would report a healthy rate with no data.
+- Using `--service` where `H` does not resolve is `TracemoonError::Config`, never an empty
+  or silently unfiltered profile.
+
+### Recording output contract (`sampler.rs`, `output/metadata.rs`)
+- `run()` freezes `elapsed` as soon as the loop ends, before child cleanup and output IO, and
+  `generate_output` uses that value. The sidecar and the SVG title therefore agree and neither
+  absorbs shutdown time.
+- `finish_record(run, output)` always attempts output and returns the **sampling** error when
+  both fail. Calling `run_result?` first would silently drop partial profiles.
+- `<output>.meta.json` is hand-written JSON: keep the `quote` escaping correct and take the
+  tick denominators (`ticks`, `failed_ticks`, `sampled_stacks`, `success_rate`) from
+  `Aggregator` instead of recomputing them.
+
 ### Symbol resolution PIE/bias math (`resolver.rs`)
 - Two bugs previously produced wrong names (e.g. "md5.lua calls getenv"). Both fixed; don't
   regress:
@@ -299,6 +350,29 @@ compared before file fallback. Missing pages/objects remain incomplete diagnosti
 Linux integration uses GDB as the target's parent, then reports after it exits;
 portable ELF wrappers over allocator exports do not replace that gate.
 
+### Heap capture: freeze, budgets, scope (`freeze.rs`, `memory/`)
+- `FrozenProcess` must stop **every** thread and prove it by re-enumerating
+  `/proc/<pid>/task` until a fresh listing adds nothing. Stopping only the main thread would
+  read a graph that other threads are still mutating.
+- Resume is `ptrace::detach(tid, recorded_signal)` only — **never** `SIGCONT`. A target the
+  operator had `SIGSTOP`ped must still be stopped afterwards (`originally_stopped`).
+- `Drop` is the cleanup path for every error return and Ctrl+C (2 s deadline). It cannot
+  recover from the tracer being SIGKILLed; do not describe that case as covered.
+- No target reads, graph analysis or disk writes after `frozen.resume()`. `pause_ms` is stamped
+  immediately after resume, then a spawned child is terminated, then the snapshot is analysed
+  and written.
+- `BudgetReader` charges **every** remote read, including discovery, and aborts on the deadline
+  or Ctrl+C. `--max-pause-ms` covers freeze + copy only; cleanup may exceed it.
+- Incomplete captures are still written and then exit nonzero; failures *before* the freeze
+  (bad flags, unknown version, unseizable target) produce no snapshot at all. Do not "fix" a
+  budget hit by resuming mid-capture and mixing fresh reads into the same graph.
+- Heap decoding uses `HeapLayout`, not `LuaLayout`, and only 5.4 is implemented. 5.5 is
+  rejected rather than guessed.
+- skynet `G_SHARED` objects are followed for supported types, marked `shared`, excluded from
+  per-service private totals, and deduplicated by address across the selected heaps.
+- ELF core input never zero-fills a missing `p_filesz` range and never opens paths recorded in
+  `NT_FILE`. Only immutable bytes from an explicit `--exe` may be recovered.
+
 ## Conventions
 
 - **Errors, not panics**, on anything touching target memory or the target process. Reserve
@@ -318,7 +392,9 @@ portable ELF wrappers over allocator exports do not replace that gate.
    walk). None of these need a target process: `process::reader::testing::WindowReader` is an
    in-memory byte window, so a test builds a `lua_State`/`CallInfo`/`Proto` image and walks it.
    Add tests there (`stack.rs`) rather than spinning up Lua for behaviour that is pure
-   memory layout.
+   memory layout. Heap decoding follows the same pattern in `memory/tests.rs`; after
+   `bash tests/build-vendor.sh`, setting `TRACEMOON_HEAP_FIXTURE` and
+   `TRACEMOON_SKYNET_HEAP_FIXTURE` also runs those tests against real allocator exports.
 2. `cargo clippy --all-targets -- -D warnings` and `cargo fmt --check` — both are enforced by
    CI (`.github/workflows/ci.yml`). Note the crate is a binary, so an unused `pub` item is a
    `dead_code` warning: delete dead helpers instead of leaving them, and use the targeted
@@ -340,6 +416,11 @@ portable ELF wrappers over allocator exports do not replace that gate.
    `gcov` frames (should be zero), confirm `md5.lua:12→lmd5` / `md5.lua:13→str_gsub`, and
    confirm the success rate is ~99%+ (a crash to ~0% means discovery locked onto a false
    positive).
+5. **Linux real-process acceptance** — `cargo test --release --test integration -- --ignored
+   --test-threads=1` (CI runs it as a dedicated job with `gdb` installed). It invokes the real
+   CLI for plain Lua and skynet, asserts CPU stacks and heap reports, and generates a real ELF
+   core through GDB for the offline path. The file is `#![cfg(target_os = "linux")]`, so it
+   compiles to zero tests on macOS — do not read that as coverage.
 
 > macOS needs root even in spawn mode (`task_for_pid` is the gate, not ptrace), so a local
 > macOS run without `sudo` fails with `Inappropriate ioctl for device (os error 25)`. Linux
@@ -354,5 +435,7 @@ portable ELF wrappers over allocator exports do not replace that gate.
 | Spawn no-miss-startup | ✅ (ptrace hold) | ✅ | ⚠️ best-effort |
 | Spawn without root | ✅ | ✅ | ❌ (task_for_pid) |
 | Symbol resolution | ELF | ELF | Mach-O |
+| `mem capture` (live heap) | ✅ | ✅ | ❌ config error |
+| `mem report` / `inspect` | ✅ `.tmoon` + ELF core | ✅ `.tmoon` + ELF core | ✅ `.tmoon` + ELF core |
 
 Primary development/test target is **Linux x86_64**.

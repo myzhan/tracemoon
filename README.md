@@ -52,9 +52,12 @@ open flamegraph.svg
 tracemoon <SUBCOMMAND> [OPTIONS] [-- <COMMAND>...]
 
 SUBCOMMANDS:
-  record   Record a profile to a flamegraph / collapsed file
-  dump     Print a one-shot snapshot of the current stack(s) and exit
-  top      Live-updating terminal view of the hottest functions
+  record         Record a profile to a flamegraph / collapsed file
+  dump           Print a one-shot snapshot of the current stack(s) and exit
+  top            Live-updating terminal view of the hottest functions
+  mem capture    Pause a Linux Lua 5.4 process and save its heap graph
+  mem report     Analyze a heap snapshot or Linux ELF core offline
+  mem inspect    Show one captured object's holding paths and preview
 
 OPTIONS (record / top):
   -p, --pid <PID>          Attach to a running Lua process by PID
@@ -193,7 +196,6 @@ accounting still uses the same strong reference graph. `--show-addresses` on `re
 `inspect` includes exact addresses. Object numbers are display references within each
 service, not addresses accepted by `--object`.
 
-`mem report` supports `--format text|html`; an explicit format overrides the extension.
 Input is detected by content: either a saved `.tmoon` graph or a raw Linux ELF64 core
 (little-endian x86_64/aarch64). Core analysis works offline on 64-bit Linux and macOS,
 without ptrace or a live PID. Supply the matching ELF binary with `--exe`; skynet needs
@@ -209,9 +211,11 @@ supported. Export a systemd-managed core with `coredumpctl dump -o core.dump` fi
 Offline core extraction has fixed limits of 60 seconds, 1 GiB requested memory reads,
 1 million objects and 2 million edges. Unknown original PID/time/pause metadata is not
 presented as a measured capture. A core can contain a heap interrupted mid-update or
-damaged before the crash; freezing does not run GC or establish a leak verdict.
-Without it, `.html`/`.htm` selects HTML and other paths/stdout use text. HTML embeds its
-styles and scripts and works offline, with service filters, search, a compact sortable
+damaged before the crash; extraction does not run GC or establish a leak verdict.
+
+`mem report` supports `--format text|html`; an explicit format overrides the extension.
+Without `--format`, `.html`/`.htm` selects HTML and other paths/stdout use text. HTML embeds
+its styles and scripts and works offline, with service filters, search, a compact sortable
 object table, and row details for holding paths/examples. Module grouping
 is a presentation heuristic; completeness and conservative GC semantics remain visible.
 

@@ -12,7 +12,18 @@ a one-shot snapshot, or a live `top` view. `skynet` processes, which host many L
 single OS process, are supported first-class.
 
 **Targets:** plain Lua 5.4 / 5.5 (single VM) and skynet (multi VM).
-**Platforms:** Linux x86_64 (primary), Linux aarch64, macOS x86_64 / arm64.
+**Platforms:** Linux x86_64 (primary), Linux aarch64, macOS x86_64 / arm64. Live heap
+capture is 64-bit Linux only; its offline reports are portable.
+
+There are two subsystems, and they share only the reader and VM-discovery layer:
+
+- **CPU sampling** — `record` / `dump` / `top`. Walk the Lua `CallInfo` chain and the native
+  C stack, aggregate per tick, emit a flamegraph, collapsed stacks, a snapshot or a live
+  view. Every section up to "Heap snapshots" is about this subsystem.
+- **Heap ownership** — `mem capture` / `mem report` / `mem inspect`. Freeze every thread,
+  copy the Lua object graph, resume the target, then analyze offline. Scope and open
+  questions live in [memory-snapshot-design.md](memory-snapshot-design.md); the "Heap
+  snapshots" section below covers how the code is wired.
 
 ---
 
@@ -20,13 +31,18 @@ single OS process, are supported first-class.
 
 ```
 main.rs                 CLI dispatch: (pid, command) -> attach | spawn | error
- └─ config.rs           clap parsing -> Config { mode, pid, command, rate, duration, ... }
- └─ sampler.rs          Sampler: Target, reader, layout, Mode, resolver, aggregator
-     ├─ Target          Attach(Pid) | Spawn(SpawnedChild)
-     ├─ Mode            Single { addr: Cell } | Skynet { h_addr }
-     ├─ run()           tick loop @ rate Hz; resumes a spawned child; stops on
-     │                  duration / Ctrl+C / target exit
-     └─ sample()        walk Lua stack(s) (+ native merge in single mode) -> aggregate
+ └─ config.rs           clap parsing -> Config { mode, pid, command, rate, duration, services }
+ ├─ sampler.rs          Sampler: Target, reader, layout, Mode, resolver, aggregator
+ │   ├─ Target          Attach(Pid) | Spawn(SpawnedChild)
+ │   ├─ Mode            Single { addr: Cell } | Skynet { h_addr }
+ │   ├─ run()           tick loop @ rate Hz; resumes a spawned child; stops on
+ │   │                  duration / Ctrl+C / target exit
+ │   └─ sample()        walk Lua stack(s) (+ native merge in single mode) -> aggregate
+ │
+ └─ memory/mod.rs       mem capture | mem report | mem inspect
+     ├─ capture_process()  preflight -> freeze -> capture -> resume -> analyze -> write
+     └─ run()              report: core::read (ELF core) or snapshot::read (.tmoon)
+                           -> analyze::classify -> text | html
 ```
 
 One tick produces **one stack** in single-VM mode and **one stack per service** in skynet
@@ -54,9 +70,20 @@ src/
 │   ├── linux.rs            Linux reader (process_vm_readv via read-process-memory)
 │   ├── macos.rs            macOS reader (mach_vm_read via read-process-memory)
 │   ├── discovery.rs        lua_State memory scan + Lua version detection
-│   ├── skynet.rs           H -> slots -> snlua.activeL enumeration
+│   ├── skynet.rs           H -> slots -> snlua.activeL enumeration (+ handles, labels)
 │   ├── native_stack.rs     Native C stack: libunwind-ptrace (Linux) / FP walk (macOS)
+│   ├── freeze.rs           FrozenProcess: all-thread ptrace seize/interrupt for heap capture
 │   └── spawn.rs            SpawnedChild: exec-stop hold, resume, reap, terminate (RAII)
+│
+├── memory/                 heap ownership subsystem (CPU sampler never touches it)
+│   ├── mod.rs              `mem` CLI definitions -> MemoryCommand -> capture/report dispatch
+│   ├── layout.rs           HeapLayout: heap-only offsets (tables, strings, global_State)
+│   ├── capture.rs          BudgetReader + ownership-list walk -> Snapshot
+│   ├── snapshot.rs         Versioned JSON object graph (serde) + completeness flags
+│   ├── analyze.rs          Strong reachability, candidate ranking, holding paths, text report
+│   ├── core.rs             ELF64 core input behind the same ProcessMemoryReader trait
+│   ├── html.rs             Standalone HTML report (+ embedded report.js / style.css)
+│   └── tests.rs            Decoder tests over allocator-exported heap fixtures
 │
 ├── symbols/
 │   ├── resolver.rs         ELF/Mach-O symbol lookup (addr -> name, name -> addr)
@@ -66,8 +93,14 @@ src/
     ├── aggregator.rs       Tick accounting + stacked-stack aggregation
     ├── collapsed.rs        Collapsed text + inferno flamegraph SVG + stderr stats
     ├── dump.rs             `dump` mode snapshot formatting
+    ├── metadata.rs         `<output>.meta.json` sidecar for `record`
     └── top.rs              `top` mode live view rendering
 ```
+
+`memory/` deliberately does not reuse the CPU `LuaLayout` for heap decoding (see "Heap ABI")
+or the CPU `Aggregator`; sharing happens at the reader, symbol and VM-discovery level only —
+VM enumeration still reads a `lua_State` through `LuaLayout`, then decodes the heap with
+`HeapLayout`.
 
 ---
 
@@ -319,7 +352,12 @@ FIFO cache (hits do not reorder — resolved addresses stay hot for the whole ru
   mode the VM does not exist yet when the child is frozen at `execve`.
 - **skynet:** `H` (`handle_storage`) -> slot array -> `skynet_context.instance` ->
   `snlua.activeL`. Re-enumerated every tick, because services come and go. C services
-  (no `activeL`) are skipped.
+  (no `activeL`) are skipped. Each VM also carries its `skynet_context` handle and registered
+  name, which is exactly what `--service` matches.
+- **skynet ABI:** the same `5.4` release string hides a different struct layout, so
+  `LuaLayout::for_skynet` (TString.id: length@24, inline bytes@32) is chosen by resolving
+  `H`, never by the version string. Heap capture makes the same choice with
+  `HeapLayout::skynet54` (see "Heap ABI").
 - **Lua version:** scan the mapped binaries' rodata for the `Lua 5.N` string. This can
   legitimately fail at construction (a dynamically linked interpreter is not mapped yet at
   the exec-stop), in which case the sampler starts on 5.4 and re-detects at most every
@@ -364,6 +402,149 @@ Output format follows the extension: `.svg` -> interactive flamegraph (inferno,
 bottom-up / icicle), anything else -> collapsed text (`stack;stack;stack count`), which
 `flamegraph.pl` accepts.
 
+**Service filtering.** `--service <label-or-handle>` is repeatable and ORed. It matches the
+*exact* discovered label (a leading dot included) or a lowercase eight-digit handle such as
+`:01000012`. Filters are applied per VM before walking, so an unselected service contributes
+nothing. A walk that returns no Lua frames is skipped rather than turned into a synthetic-root
+success, otherwise filtering to one idle service would report a healthy success rate. When no
+selected service is present or walkable, ticks are failures and the success rate describes the
+selection only. `--service` on a target where `H` does not resolve is a config error, not a
+silent no-match.
+
+**Sidecar metadata.** Every `record` also writes `<output>.meta.json`:
+`schema_version`, `tracemoon`, `pid`, `command` (spawn argv, `null` when attached),
+`services`, `lua_version`, `layout_confirmed`, `sample_rate`, `started_at_unix_secs`,
+`duration_secs`, `ticks`, `failed_ticks`, `sampled_stacks`, `success_rate`. It is hand-written
+in `output/metadata.rs` (no serde, no partial-serialisation failure mode), and
+`duration_secs` is frozen in `Sampler::run` as soon as the loop ends — before child cleanup
+and output IO — so it never absorbs shutdown time.
+
+**Output on the error path.** `finish_record(run, output)` always attempts output generation
+after the loop, including when sampling failed, so a partial profile is not discarded. If both
+fail, the *sampling* error is the one returned and the save failure is only logged. There are
+no periodic checkpoints: if tracemoon is SIGKILLed, nothing is written.
+
+---
+
+## Heap snapshots (`mem`)
+
+`mem` answers a different question — *who owns the bytes* — and therefore runs a different
+pipeline instead of sampling. It reads remote memory only while the target is stopped;
+everything after `frozen.resume()` is local work.
+
+### Capture pipeline
+
+`memory/mod.rs::capture_process`:
+
+1. **Preflight** — 64-bit Linux only, the output directory must exist, install the Ctrl+C
+   flag. A `-- <command>` target is spawned with the usual exec-stop hold, resumed and given
+   `--startup-ms` (default 200) to initialise before its PID is used; capture always
+   terminates a child it spawned.
+2. **Identify** — `detect_lua_version` must report 5.4 (`--lua-version 5.4` only asserts a
+   verified target; 5.5 is rejected). `SkynetDiscovery::resolve_h` decides the ABI, and
+   `--state` is single-VM only, so it conflicts with `--service`.
+3. **Freeze** — `FrozenProcess::new(pid, deadline)` where the deadline is
+   `now + --max-pause-ms`.
+4. **Copy** — a `BudgetReader` wraps the platform reader, then `capture::discover`
+   (VM enumeration, deduplicated by `global_State`) and `capture::collect` (ownership lists,
+   roots, references, object decoding) fill the snapshot in memory.
+5. **Resume, then analyse** — `frozen.resume()`, then `pause_ms`, `read_bytes`, child
+   termination, `analyze::classify`, `Snapshot::write` and the stdout report. No target reads,
+   graph analysis or disk writes happen while the target is still frozen.
+
+A capture that hits a budget, loses a read or cannot resume is still written with
+`incomplete = true` and a diagnostic, prints the report and exits nonzero. Failures *before*
+the freeze (bad flags, unknown Lua version, unseizable target) return without a snapshot.
+Budgets: `--max-pause-ms` 2000 (max 60 s), `--max-objects` 1,000,000 (4 M), `--max-edges`
+2,000,000 (8 M), `--max-read-mib` 256 (4096, including discovery). The pause budget covers
+freeze + copy; cleanup may exceed it.
+
+### Freezing every thread
+
+`FrozenProcess` is an RAII guard in `process/freeze.rs`, compiled only on Linux (elsewhere
+`new` returns a "capture is Linux-only" config error, while `report`/`inspect` stay portable).
+
+- `new` re-enumerates `/proc/<pid>/task` until **every observed thread is stopped**. The loop
+  only exits when a fresh enumeration finds nothing new, which closes the race with threads
+  cloned before their parent was stopped.
+- Each thread's `State:` line is read *before* seizing; a `T` (job-control) stop is recorded
+  in `originally_stopped`. `ptrace::seize` + `ptrace::interrupt` stop the thread, and the
+  `PTRACE_EVENT_STOP` handler re-delivers job-control stops. **SIGCONT is never sent.**
+- `resume()` detaches each thread with the signal recorded for it, so a target the user had
+  `SIGSTOP`ped is still stopped afterwards.
+- `Drop` is the cleanup path for every error return and Ctrl+C: it interrupts anything not yet
+  observed stopped (2 s deadline) and detaches the rest. It cannot recover from the tracer
+  itself being killed — that case is not covered.
+- Threads that exit mid-freeze are dropped on `ESRCH`/`ECHILD`; a `seize` failure aborts the
+  capture instead of pretending a live thread is frozen.
+
+A frozen target can still be caught mid-update of a table or GC list. A read that fails or
+decodes inconsistently marks the heap incomplete; the code never retries in place and never
+resumes early to mix freshly read data into the same snapshot.
+
+### Heap ABI
+
+`memory/layout.rs` (`HeapLayout`) is deliberately separate from the CPU `LuaLayout`: it
+describes allocation sizes, ownership lists and roots only.
+
+- Ownership lists, relative to `global_State`: `allgc`@112, `finobj`@128, `tobefnz`@176,
+  `fixedgc`@184. There is no generation-boundary pointer to double count.
+- `Table` is 56 bytes: flags@10, `lsizenode`@11, `alimit`@12, array@16, node@24,
+  `lastfree`@32, metatable@40. A `Node` is 24 bytes: `TValue key`@0, `TValue value`@8,
+  `next`@16.
+- `TString` short length is at 11; the union at 16 holds the long length, and 5.4 keeps the
+  bytes inline at 24.
+- Closures: `nupvalues`@10, `p`/`f`@24, upvalue `TValue`s at 32. An `UpVal` object is
+  40 bytes: `v`@16 points into the owning thread's stack while the upvalue is open, or at its
+  own `value`@24 once closed (`next` shares that offset). Open upvalues are therefore read
+  from the stack, not from the `UpVal`.
+- `HeapLayout::skynet54()` moves `global_State.gcstate` from 101 to 97 and keeps skynet's
+  `TString.id` layout (length@24, inline bytes@32). It is selected by `H`, never by version
+  text.
+- Lua 5.5 heap decoding is intentionally absent: `mem capture` rejects 5.5 instead of
+  guessing offsets.
+
+skynet code-cache `Proto`/string objects carry `G_SHARED` (age bits = 7) and can sit outside a
+service's GC chains. Capture follows only the supported shared types, includes their
+references, marks them `shared`, and excludes their bytes from per-service private totals;
+process-wide shared totals deduplicate by address across the selected heaps.
+
+### Snapshot file and reports
+
+`Snapshot::write` serialises versioned JSON to a unique sibling temp file (`0600`), fsyncs and
+renames, so a reader never sees a half-written graph. The header pins `schema_version: 1`,
+`tool_version`, `lua_version`, `lua_abi` (`lua54` / `skynet-lua54`), `capture_method`, `pid`,
+`captured_unix_secs`, `pause_ms`, `read_bytes`, `limits`, `pointer_width`, `target_endian`,
+`incomplete`, `diagnostics` and the heaps. `Snapshot::read` enforces schema 1, Lua 5.4, a 2 GiB
+input cap and unique addresses per heap. Object addresses identify objects *within one
+snapshot only*.
+
+`analyze::classify` then does the graph work: strong reachability from the recorded roots, a
+bounded large-object ranking, and holding paths. Weak values are not traversed, weak-key
+ephemerons are not solved to a fixed point, and finalisation semantics are incomplete. An
+object without a confirmed strong path is reported as *unconfirmed reachable*, never as
+garbage, and `retained`/exclusive sizes are not promised. The text report is English and goes
+to stdout by default; the HTML report is a self-contained Chinese file (inline CSS/JS) with
+service filters, search, sortable object tables and row details. Both render the same
+`Snapshot`, so `--top` and `--show-addresses` behave identically.
+
+### Offline cores
+
+`mem report` / `mem inspect` detect input by content: a `.tmoon` snapshot, or a raw Linux
+ELF64 core, wrapped by `memory/core.rs` behind the same `ProcessMemoryReader`, so
+`capture::discover_ranges` and every decoder are shared. `PT_LOAD` translates virtual
+addresses to file offsets; `AT_PHDR` / `NT_FILE` recover the PIE bias. `--exe` supplies the
+matching ELF; skynet needs it to keep `H` and therefore the patched ABI. `--exe`,
+`--lua-version`, `--state` and `--service` are core-only and rejected for `.tmoon` input.
+
+`p_memsz` is not proof that bytes were dumped: a missing `p_filesz` range is an error, never
+zero-filled, and only immutable bytes may be recovered from an explicitly supplied `--exe`
+(never writable pages or BSS). Paths recorded in `NT_FILE` are never opened. Extraction runs
+under fixed limits (60 s, 1 GiB of reads, 1 M objects, 2 M edges), records
+`capture_method = "Linux ELF coredump (offline)"`, and leaves PID/time/pause at zero rather
+than inventing them. Compressed cores, Mach-O cores and Lua 5.5 are unsupported. Reports work
+on any 64-bit little-endian host, including macOS, without ptrace.
+
 ---
 
 ## CLI
@@ -372,9 +553,12 @@ bottom-up / icicle), anything else -> collapsed text (`stack;stack;stack count`)
 tracemoon <SUBCOMMAND> [OPTIONS] [-- <COMMAND>...]
 
 SUBCOMMANDS
-  record   Record a profile to a flamegraph / collapsed file
-  dump     Print a one-shot snapshot of the current stack(s) and exit
-  top      Live-updating terminal view of the hottest functions
+  record         Record a profile to a flamegraph / collapsed file
+  dump           Print a one-shot snapshot of the current stack(s) and exit
+  top            Live-updating terminal view of the hottest functions
+  mem capture    Save a Lua 5.4 heap graph (64-bit Linux)
+  mem report     Analyse a .tmoon snapshot or a Linux ELF64 core offline
+  mem inspect    Show one captured object's holding paths and preview
 
 TARGET (exactly one)
   -p, --pid <PID>          attach to a running process (requires root / CAP_SYS_PTRACE)
@@ -385,10 +569,34 @@ OPTIONS (record, top)
   -d, --duration <SECS>    duration (0 = until Ctrl+C, default 0)
   -o, --output <FILE>      record only (default flamegraph.svg)
       --lua-version <VER>  force the layout: 5.4 or 5.5 (default: auto-detect)
+      --service <VALUE>    skynet service label or :xxxxxxxx handle (repeatable)
+
+MEM CAPTURE
+  -o, --output <FILE>      default heap.tmoon
+      --service <VALUE>    capture only these skynet services (repeatable)
+      --lua-version 5.4    assert the version instead of detecting it
+      --state <HEX>        known lua_State address (single VM; conflicts with --service)
+      --startup-ms <MS>    init wait for a spawned child (default 200)
+      --max-pause-ms <MS>  freeze + capture budget (default 2000, max 60000)
+      --max-objects <N>    default 1000000, max 4000000
+      --max-edges <N>      default 2000000, max 8000000
+      --max-read-mib <N>   default 256, max 4096, includes discovery
+
+MEM REPORT / INSPECT
+  --exe <FILE>             matching ELF for a core (skynet needs H)
+  --lua-version 5.4        assert a verified core version
+  --state <HEX>            known lua_State address in a single-VM core
+  --service <VALUE>        select skynet services in a core (report only)
+  --format text|html       default: html for .html/.htm output, otherwise text
+  --show-addresses         include raw pointers
+  --top <N>                large objects per heap (default 10, max 100)
+  --object <HEX>           inspect only, required there
 ```
 
-`dump` accepts only the target and `--lua-version`. A PID must be a positive integer;
-`0` and negative values are rejected, since `kill(0, …)` addresses the process group.
+`dump` accepts the target, `--lua-version` and `--service`. A PID must be a positive integer;
+`0` and negative values are rejected, since `kill(0, …)` addresses the process group. `mem
+inspect` takes no `--service`: narrow the snapshot during `capture`/`report`, then select the
+object by its snapshot address.
 
 ---
 
@@ -421,8 +629,10 @@ On macOS there is no ptrace-hold: spawn is "start it, then sample immediately".
 | `object` 0.36 (`read`,`elf`,`macho`) | ELF / Mach-O symbol tables |
 | `inferno` 0.12 | flamegraph SVG |
 | `nix` 0.27 (`process`,`ptrace`,`signal`) | ptrace, signals, waitpid |
+| `serde` 1 (`derive`) / `serde_json` 1 | versioned heap snapshots |
 | `libc` 0.2 | Mach / POSIX shims |
-| `thiserror`, `log`, `env_logger`, `ctrlc`, `chrono`, `anyhow`, `memmap2` | support |
+| `thiserror`, `log`, `env_logger`, `ctrlc` | support |
+| `tempfile` (dev) | snapshot/sidecar tests |
 
 Rust 1.82+ (`offset_of!`, `Option::is_none_or`).
 
@@ -436,6 +646,8 @@ Rust 1.82+ (`offset_of!`, `Option::is_none_or`).
 | Native C merge | yes (libunwind-ptrace) | no (empty) | yes (task_for_pid) |
 | Spawn without root | yes | yes | no (task_for_pid) |
 | Symbol resolution | ELF | ELF | Mach-O |
+| `mem capture` (live) | yes | yes | no |
+| `mem report` / `inspect` | yes (`.tmoon` + ELF core) | yes (`.tmoon` + ELF core) | yes (`.tmoon` + ELF core) |
 
 ---
 
@@ -450,3 +662,6 @@ Per-frame walk output, TValue tags, symbol lookups and native-unwind failures ar
 collapsed output (that means the symbol filter or the load-base math regressed), and a
 success rate of ~99% or better (a collapse to ~0% means discovery locked onto a false
 positive).
+
+`mem capture` prints its diagnostics to stderr and stores them in the snapshot, so a bad
+report can be reproduced offline from the `.tmoon` file without keeping the target alive.

@@ -19,8 +19,9 @@ skynet 的 Lua 分支虽然版本号相同，但 TString 带额外 id，gcstate 
 `capture_method`，不会被表述为全进程同时暂停的快照。
 
 验证：两个 vendor 的真实 C 头文件布局校验与分配器导出堆测试已在本地主机通过，
-Linux 分支交叉编译/Clippy 通过。Linux 暂停恢复与完整抓取用例已加入 CI，实际执行及
-真实 skynet 验收仍待完成。下面的预算和验收条款是持续约束，不能仅凭编译通过视为全部完成。
+Linux 分支交叉编译/Clippy 通过。Linux 暂停恢复与完整抓取用例已随 CI 的 integration job
+实际执行（含 GDB 真实 core），真实 skynet 验收也由同一套用例覆盖。下面的预算和验收条款
+是持续约束，不能仅凭编译通过视为全部完成。
 
 ## 1. 要回答的问题
 
@@ -151,15 +152,24 @@ Lua 堆快照 / PID 12345
 4. 复制对象记录、根和引用数据到快照构建缓冲区，保留离线分析必需的数据。
 5. 完成或遇到限制立即恢复进程，再序列化产物和执行路径分析。
 
-Linux 实现候选为 ptrace seize/interrupt 全线程，并在冻结过程中处理线程创建；
-具体事件处理和原有 job-control stop 的保存/恢复需要原型验证。不能只停止主线程，
-也不能用 SIGCONT 无条件恢复一个原本就被用户暂停的进程。
+Linux 实现为 `process/freeze.rs` 的 `FrozenProcess`：对每个线程 `ptrace::seize` 加
+`ptrace::interrupt`，反复枚举 `/proc/<pid>/task` 直到一次完整枚举不再出现新线程才认为
+冻结完成，因此冻结过程中新建的线程不会被漏掉。
 
-守卫必须覆盖错误返回、信号取消和部分冻结失败的清理。不能声称 Drop 能处理 SIGKILL；
-需单独验证 tracer 意外退出时的恢复行为，避免采用会连带杀死目标的设置。
+每个新线程先读 `/proc/<pid>/task/<tid>/status` 的 `State:` 行，发现 `T`（job-control
+暂停）就记入 `originally_stopped`。`PTRACE_EVENT_STOP` 事件会重新投递 job-control stop，
+恢复时只用 `ptrace::detach(tid, signal)` 逐个线程 detach，**绝不发 SIGCONT**：用户原本
+`SIGSTOP` 的目标在抓取结束后仍然是停止状态（有专门用例覆盖）。不能只停止主线程，
+也不能用 SIGCONT 无条件恢复。
 
-设置暂停时限、对象数、边数和采集字节数上限。到限恢复并保存带 incomplete 标志的
-结果；不能把截断结果称为全堆统计。时限是尽力而为，并非对内核阻塞的硬实时保证。
+守卫覆盖错误返回、信号取消和部分冻结失败的清理：`FrozenProcess` 的 `Drop` 会先 interrupt
+尚未确认停止的线程（2 秒兜底时限）再逐个 detach。它不能处理 tracer 自己被 SIGKILL 的情况，
+也不能声称能处理；该场景需要单独验证，避免采用会连带杀死目标的设置。
+
+暂停预算 `--max-pause-ms` 覆盖冻结和复制两个阶段，清理（detach、终止子进程）可能超出，
+报告展示的是实际 `pause_ms`。设置暂停时限、对象数、边数和采集字节数上限。到限恢复并
+保存带 incomplete 标志的结果；不能把截断结果称为全堆统计。时限是尽力而为，并非对内核
+阻塞的硬实时保证。
 
 冻结消除了后续并发写入，但线程可能恰好停在修改 table/GC 链的中间。读取成功不等于
 数据结构完整。交叉校验链节点、tag、容量和引用，失败按 VM 标记不完整；不在原地无限
@@ -213,17 +223,25 @@ GC 对象名单不是根集合。所有 coroutine 的栈也不能无条件设为
 复用平台 reader、符号和 VM 发现能力；不让 CPU `Aggregator` 接管堆分析。
 
 ```text
-process/freeze.rs       平台冻结守卫和恢复
-lua/heap_layout.rs      堆字段与版本布局、类型大小
-memory/capture.rs       VM 去重、对象枚举、根与引用采集、预算
-memory/snapshot.rs      版本化离线对象图和完整性标记
-memory/analyze.rs       强可达、候选排行、路径和摘要
-output/memory.rs        文本报告和离线 inspect
+process/freeze.rs       平台冻结守卫和恢复（FrozenProcess，仅 Linux 编译）
+memory/mod.rs           mem CLI、capture_process 编排、恢复后分析与落盘顺序
+memory/layout.rs        堆字段与版本布局、类型大小（HeapLayout）
+memory/capture.rs       BudgetReader、VM 去重、对象枚举、根与引用采集
+memory/snapshot.rs      版本化离线对象图和完整性标记（JSON，原子写入）
+memory/analyze.rs       强可达、候选排行、路径和文本摘要
+memory/core.rs          ELF64 core 输入（同一 ProcessMemoryReader 实现）
+memory/html.rs          离线 HTML 报告（内嵌 JS/CSS）
 ```
 
-快照头包含工具版本、格式版本、Lua 布局、指针宽度、端序、时间、选中的服务、暂停耗时、
-各类上限、覆盖率和诊断。对象 ID 仅在该快照内有效，不作为跨快照身份。
-保存文件使用临时文件再 rename，部分采集与文件写入损坏是两种不同状态。
+实现相对本章早先建议的差异：堆布局落在 `memory/layout.rs` 而不是 `lua/heap_layout.rs`，
+避免与 CPU 的 `LuaLayout` 混用；文本与 HTML 报告都在 `memory/` 下，不再有独立的
+`output/memory.rs`；ELF core 解析独立成 `memory/core.rs`。CPU 采样器完全不引用这些模块，
+共享只发生在 reader、符号解析和 VM 发现层。
+
+快照头包含工具版本、格式版本（`schema_version: 1`）、Lua 版本与 `lua_abi`、指针宽度、
+端序、采集时间、`capture_method`、暂停耗时、各类上限、`read_bytes`、诊断和 heaps。
+对象 ID 仅在该快照内有效，不作为跨快照身份。保存文件使用临时文件再 rename，部分采集
+与文件写入损坏是两种不同状态。
 
 ## 9. 验收与实施顺序
 
