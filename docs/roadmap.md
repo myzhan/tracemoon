@@ -21,7 +21,7 @@ The latest changes implement three improvements:
 | T1-3 Metadata | `record` writes `<output>.meta.json` with target context and sampling statistics | No checkpoint or timeline implied |
 | T1-4 Error-path output | Attach/spawn recording attempts output even when sampling returns an error; the original sampling error takes precedence | Periodic checkpoints deferred |
 | T2-1 Service filtering | Repeatable `--service` in record/dump/top, matching exact labels or `:xxxxxxxx` handles before stack walking | Split files deferred |
-| T3-1 Heap snapshot | Linux Lua 5.4 capture, portable offline report/inspect, large-object candidates and holding paths | Linux runtime/skynet acceptance, Lua 5.5, richer GC semantics |
+| T3-1 Heap snapshot | Linux Lua 5.4 capture, portable offline report/inspect, large-object candidates and holding paths | Real-workload validation, Lua 5.5, richer GC semantics |
 
 Metadata includes a schema version, tool version, PID, spawn argv (null for attach),
 service selectors, Lua layout and confirmation status, requested sample rate, start time
@@ -36,9 +36,9 @@ A synthetic service root alone must not count as a successful sample.
 host Clippy, and Linux x86_64 cross-target Clippy pass locally. The heap ABI is independently
 checked against the pinned Lua and skynet C headers. Both real allocator-dump decoder tests
 pass locally, including skynet's patched string/GC offsets. Upstreams are test submodules;
-CI explicitly runs `tests/integration.rs` for real Lua and skynet CPU/heap capture, service
-filters and offline reports. These Linux runtime checks still require execution on Linux;
-local macOS validation is not a substitute. See [test setup](../tests/README.md).
+CI explicitly runs `tests/integration.rs` and that job passes on Linux for real Lua and
+skynet CPU/heap capture, service filters and offline reports. Local macOS validation is not
+a substitute for it. See [test setup](../tests/README.md).
 
 ## Immediate priorities
 
@@ -54,7 +54,8 @@ fixed day-count or line-count estimate for the heap analyzer.
 
 ## Main feature in progress: single heap snapshot (T3-1)
 
-**Status: initial Lua 5.4 implementation; Linux runtime and skynet acceptance pending.**
+**Status: initial Lua 5.4 implementation; Linux runtime and skynet acceptance pass in CI,
+validation on real workloads remains.**
 
 Available commands are `mem capture`, `mem report`, and `mem inspect`. Capture supports
 attach or spawn on 64-bit Linux; offline reporting also works on macOS. The saved JSON
@@ -68,9 +69,9 @@ are read offline on Linux/macOS, with AT_PHDR/NT_FILE relocation, explicit execu
 read-only recovery, and incomplete diagnostics for missing writable mappings/objects.
 Skynet requires a matching unstripped ELF binary with `H`. Lua 5.5, compressed/Mach-O cores,
 and shared-library file recovery remain unsupported. Extraction uses fixed 60-second,
-1 GiB-read, 1-million-object and 2-million-edge budgets. Portable ELF/allocator tests and
-Linux cross-Clippy pass; real GDB Lua/skynet core acceptance is added to Linux CI and
-still requires execution there.
+1 GiB-read, 1-million-object and 2-million-edge budgets. Portable ELF/allocator tests,
+Linux cross-Clippy, and the real GDB Lua/skynet core cases pass in the Linux CI job; they
+remain the acceptance gate for any change in this area.
 Default capture budgets are 2 seconds, 1 million objects, 2 million edges, and 256 MiB of
 remote reads. Capture limits return a saved incomplete result and a nonzero exit status.
 
