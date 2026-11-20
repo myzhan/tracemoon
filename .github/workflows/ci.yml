@@ -21,27 +21,25 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # `macos-latest` resolves to an arm64 runner, and GitHub's arm64 macOS pool has
-        # chronic capacity problems — jobs sit in the queue and are eventually cancelled
-        # with "not acquired by Runner of type hosted". The Intel image is x86_64 and
-        # queues normally; between the two we still cover both macOS architectures
-        # across runner images.
         os: [ubuntu-latest, macos-15-intel]
     steps:
       - uses: actions/checkout@v5
+        with:
+          # jemalloc is intentionally disabled; no recursive third-party fetch is needed.
+          submodules: true
 
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
 
-      # `remoteprocess` links against libunwind and liblzma on Linux; the runners
-      # ship the runtime libs but not the unversioned dev symlinks the linker needs.
       - name: Install native build dependencies (Linux)
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y liblzma-dev libunwind-dev
+        run: sudo apt-get update && sudo apt-get install -y build-essential liblzma-dev libunwind-dev
 
       - uses: Swatinem/rust-cache@v2
+
+      - name: Build pinned Lua and skynet test vendors and ABI fixtures
+        run: bash tests/build-vendor.sh
 
       - name: cargo fmt
         run: cargo fmt --all --check
@@ -49,57 +47,37 @@ jobs:
       - name: cargo clippy
         run: cargo clippy --all-targets -- -D warnings
 
-      - name: cargo test
+      - name: Unit tests with both Lua allocator fixtures
+        env:
+          TRACEMOON_HEAP_FIXTURE: ${{ github.workspace }}/target/test-vendor/heap-fixture
+          TRACEMOON_SKYNET_HEAP_FIXTURE: ${{ github.workspace }}/target/test-vendor/heap-fixture-skynet
         run: cargo test --all-targets
 
       - name: cargo build --release
         run: cargo build --release
 
-  smoke:
-    name: spawn-mode smoke test (Lua 5.4)
+  integration:
+    name: Real Lua + skynet process capture (Linux)
     runs-on: ubuntu-latest
     needs: lint-and-test
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v5
+        with:
+          submodules: true
 
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@stable
 
-      - name: Install native build dependencies + lua5.4
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y liblzma-dev libunwind-dev lua5.4
+      - name: Install native build dependencies
+        run: sudo apt-get update && sudo apt-get install -y build-essential liblzma-dev libunwind-dev gdb
 
       - uses: Swatinem/rust-cache@v2
 
-      - name: Build release binary
-        run: cargo build --release
+      - name: Build pinned test vendors
+        run: bash tests/build-vendor.sh
 
-      # Spawn mode needs no root/CAP_SYS_PTRACE: the target is our own child, so
-      # process_vm_readv and ptrace seize are always permitted. This is the
-      # end-to-end check that walking/discovery/symbol resolution still work.
-      - name: Record a profile of a spawned Lua process
-        run: |
-          set -euo pipefail
-          ./target/release/tracemoon record -d 3 -o smoke.txt \
-            -- lua5.4 tests/lua/multi_func.lua 2> smoke.stderr
-          echo '--- stderr ---'
-          cat smoke.stderr
-          echo '--- collapsed stacks ---'
-          cat smoke.txt
-
-          test -s smoke.txt
-          # Real Lua frames must appear, named by chunk.
-          grep -q 'multi_func.lua' smoke.txt
-          # The main chunk is the only frame with a name.
-          grep -q 'main' smoke.txt
-          # Regression guard: undefined imported symbols must never be resolved.
-          if grep -qE '\bgetenv\b|gcov' smoke.txt; then
-            echo '::error::undefined/imported symbols leaked into the profile'
-            exit 1
-          fi
-          # Torn reads happen, but a near-zero success rate means discovery locked
-          # onto a false positive lua_State.
-          rate=$(grep -o 'Success rate: [0-9.]*' smoke.stderr | grep -o '[0-9.]*' | head -n1)
-          echo "success rate: ${rate}%"
-          awk -v r="${rate:-0}" 'BEGIN { exit !(r + 0 >= 90) }'
+      # These tests invoke tracemoon's actual CLI and let it spawn its own targets,
+      # preserving parent/child ptrace permission under Yama without sudo.
+      # They are ignored only in the fast suite; this job always selects them explicitly.
+      - name: CPU samples, heap captures, real ELF cores, service filters and offline reports
+        run: cargo test --release --test integration -- --ignored --test-threads=1

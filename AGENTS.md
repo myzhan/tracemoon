@@ -30,6 +30,14 @@ cargo build --release          # optimized binary at target/release/tracemoon
 cargo test                     # unit tests (no target process needed)
 ```
 
+Test upstreams are git submodules at `tests/vendor/lua` (v5.4.7) and
+`tests/vendor/skynet` (v1.8.0, patched Lua 5.4.7). Initialize with
+`git submodule update --init tests/vendor/lua tests/vendor/skynet`, then run
+`bash tests/build-vendor.sh`. Builds go under `target/test-vendor`, not into vendor trees.
+Linux acceptance is `cargo test --release --test integration -- --ignored --test-threads=1`;
+these real-process tests are explicitly selected by CI, not by the fast unit suite.
+See `tests/README.md` for the portable real-allocator fixture tests and updating pins.
+
 **This dev environment needs a linker workaround** (missing `-dev` symlinks for
 liblzma/libunwind). Build with:
 
@@ -108,6 +116,15 @@ These are the things that are easy to break and hard to notice. **Read before ed
 relevant area.**
 
 ### Lua memory layout (`layout.rs`)
+- Skynet's Lua 5.4 fork has a different ABI despite the same release string:
+  `LuaLayout::for_skynet` handles `TString.id` (length@24, inline data@32), and memory's
+  `HeapLayout::skynet54` also handles `global_State.gcstate`@97 instead of @101.
+  Select by skynet detection, not Lua version text alone. Both vendor header sets are
+  cross-checked by `tests/c/lua54_heap_layout.c`; never overwrite the embedded Lua with stock.
+- Skynet code-cache Proto/string objects marked `G_SHARED` (age bits = 7) may be outside
+  per-service GC chains. Heap capture follows only those supported shared types, includes
+  their references, and excludes their bytes from service-private totals. Process-wide
+  shared totals deduplicate addresses across the selected service graphs.
 - Offsets are **hardcoded per version for x86_64 64-bit** targets, verified with
   `offsetof`/`sizeof` against real headers. The 5.4 layout is cross-checked at compile time
   against `types.rs` `#[repr(C)]` structs (`lua54_matches_reference_structs` test). The 5.5
@@ -266,6 +283,21 @@ relevant area.**
   reaches its exec-stop). Removing it orphans the target.
 - macOS: no ptrace-hold; spawn is best-effort "spawn then sample immediately", and
   `task_for_pid` still needs root even for our own child.
+
+### Offline core memory input
+
+`mem report` / `mem inspect` detect ELF input by magic and use `src/memory/core.rs`
+instead of a PID reader. `capture::discover_ranges` is shared with live capture.
+Linux ELF64 little-endian x86_64/aarch64 cores can be analyzed on macOS too; the
+host must be 64-bit little-endian because typed readers use native endian.
+`p_memsz` is not proof bytes were dumped: missing `p_filesz` bytes must error, never
+be zero-filled. Only immutable bytes from an explicit matching `--exe` can fall back
+to that file; neither runtime-writable pages nor BSS may be synthesized. Never open
+arbitrary paths recorded in NT_FILE. Skynet needs the matching ELF `H` symbol and
+its distinct ABI. AT_PHDR/NT_FILE resolve PIE bias; available executable notes are
+compared before file fallback. Missing pages/objects remain incomplete diagnostics.
+Linux integration uses GDB as the target's parent, then reports after it exits;
+portable ELF wrappers over allocator exports do not replace that gate.
 
 ## Conventions
 

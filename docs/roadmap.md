@@ -1,277 +1,242 @@
 # Roadmap
 
-Where tracemoon is, and what we intend to build next.
+Current direction and implementation status as of 2026-11-20.
+
+[Implementation notes](lua-profiler-ptrace.md) describe the existing profiler.
+[Memory snapshot design](memory-snapshot-design.md) describes the heap analyzer and its remaining work.
+This roadmap records priorities and scope; proposed commands are not available until
+implemented and validated. The original item IDs are retained for continuity.
+
+## Current capabilities
+
+The CPU profiling foundation includes Lua 5.4/5.5 stack walking, native C merge on supported
+platforms in single-VM mode, skynet multi-VM discovery, symbol resolution, and
+`record` / `dump` / `top`. Samples describe observed stacks; they do not directly measure
+CPU execution time or individual message latency.
+
+The latest changes implement three improvements:
+
+| Item | Implemented behavior | Remaining scope |
+|---|---|---|
+| T1-3 Metadata | `record` writes `<output>.meta.json` with target context and sampling statistics | No checkpoint or timeline implied |
+| T1-4 Error-path output | Attach/spawn recording attempts output even when sampling returns an error; the original sampling error takes precedence | Periodic checkpoints deferred |
+| T2-1 Service filtering | Repeatable `--service` in record/dump/top, matching exact labels or `:xxxxxxxx` handles before stack walking | Split files deferred |
+| T3-1 Heap snapshot | Linux Lua 5.4 capture, portable offline report/inspect, large-object candidates and holding paths | Linux runtime/skynet acceptance, Lua 5.5, richer GC semantics |
+
+Metadata includes a schema version, tool version, PID, spawn argv (null for attach),
+service selectors, Lua layout and confirmation status, requested sample rate, start time
+in Unix seconds, elapsed sampling time, ticks, failed ticks, sampled stacks, and success
+rate. Elapsed sampling time excludes child cleanup and output generation.
+
+Service filters use OR semantics. Non-skynet targets reject them. The success rate applies
+to the selected services; absent or unwalkable selections produce no usable stacks.
+A synthetic service root alone must not count as a successful sample.
+
+**Validation status:** formatting, unit tests (including a real Lua 5.4.7 allocator dump),
+host Clippy, and Linux x86_64 cross-target Clippy pass locally. The heap ABI is independently
+checked against the pinned Lua and skynet C headers. Both real allocator-dump decoder tests
+pass locally, including skynet's patched string/GC offsets. Upstreams are test submodules;
+CI explicitly runs `tests/integration.rs` for real Lua and skynet CPU/heap capture, service
+filters and offline reports. These Linux runtime checks still require execution on Linux;
+local macOS validation is not a substitute. See [test setup](../tests/README.md).
+
+## Immediate priorities
+
+1. Complete Linux runtime acceptance for pause/resume and heap capture, then real skynet
+   acceptance for report usefulness, capture consistency, service identity and pause cost.
+2. Validate report clarity on representative large service heaps before expanding scope.
+   Confirm weak/conditional references and partial captures remain clearly labeled.
+3. Choose further CPU output improvements from actual usage. Speedscope is a useful
+   candidate; checkpoints depend on demand for long-running sessions.
+
+There is no requirement to finish every CPU backlog item before memory work, and no
+fixed day-count or line-count estimate for the heap analyzer.
+
+## Main feature in progress: single heap snapshot (T3-1)
+
+**Status: initial Lua 5.4 implementation; Linux runtime and skynet acceptance pending.**
+
+Available commands are `mem capture`, `mem report`, and `mem inspect`. Capture supports
+attach or spawn on 64-bit Linux; offline reporting also works on macOS. The saved JSON
+graph includes roots, objects, typed reference edges, budgets, and completeness diagnostics.
+Offline reports support text and standalone HTML (`--format text|html`, with `.html`/`.htm`
+auto-detection). HTML presents a compact sortable object table with search/service filters
+and expandable rows; it uses the same bounded graph analysis and preserves capture provenance.
+`mem report core.dump --exe ./skynet -o report.html` also accepts Linux ELF64 cores directly,
+without an import step; `mem inspect` accepts them too. Little-endian x86_64/aarch64 cores
+are read offline on Linux/macOS, with AT_PHDR/NT_FILE relocation, explicit executable
+read-only recovery, and incomplete diagnostics for missing writable mappings/objects.
+Skynet requires a matching unstripped ELF binary with `H`. Lua 5.5, compressed/Mach-O cores,
+and shared-library file recovery remain unsupported. Extraction uses fixed 60-second,
+1 GiB-read, 1-million-object and 2-million-edge budgets. Portable ELF/allocator tests and
+Linux cross-Clippy pass; real GDB Lua/skynet core acceptance is added to Linux CI and
+still requires execution there.
+Default capture budgets are 2 seconds, 1 million objects, 2 million edges, and 256 MiB of
+remote reads. Capture limits return a saved incomplete result and a nonzero exit status.
+
+The goal is a clear report from one capture: which service consumes memory, what its large
+objects contain, and which roots, module fields, or function upvalues hold those objects.
+Snapshot comparison is deferred.
+
+The earlier live-memory-sampling proposal is replaced by:
+
+1. Pause all target threads and confirm they are stopped.
+2. Capture the Lua object graph, roots, and diagnostics within explicit resource budgets.
+3. Resume the target, including on partial capture or errors.
+4. Analyze the saved graph offline and produce a readable report.
+
+The first report should show:
+
+- Capture time, actual pause duration, selected services, and coverage/limitations.
+- Per-service and per-object-type memory totals.
+- Large tables and other important containers, with shallow size and bounded content summaries.
+- Readable root paths, such as
+  `registry → _LOADED["player.cache"] → ["sessions"] → table`.
+- Alternative holding paths and available function source/upvalue names.
+- Strongly reachable bytes separately from objects whose reachability is unconfirmed.
+
+### Boundaries that define the design
+
+- Tables and strings do not record allocation source locations. A function holding a table
+  can supply a source clue, not proof of where the table was allocated.
+- `allgc` alone is insufficient. Enumerate the version-specific ownership lists, including
+  finalization and fixed-object lists, and deduplicate heaps by `global_State`.
+- GC enumeration links are not business references or roots. Unreachable coroutines must
+  not become artificial roots merely because their thread objects were enumerated.
+- Stopping all threads removes concurrent writes but can catch a structure mid-update.
+  Validate consistency and explicitly report incomplete captures.
+- Pausing does not collect garbage. Until weak references, ephemerons, finalizers, and roots
+  are modeled correctly, report “unconfirmed reachability,” not “garbage.”
+- Shallow bytes and bytes reachable through references are different measurements.
+  Reachable totals may overlap and cannot be added across report entries.
+- Precise retained size, allocation history, automatic leak verdicts, and native allocations
+  behind arbitrary userdata pointers are outside the first version.
+- Lua object bytes are not process RSS. Allocator metadata and fragmentation are excluded.
 
-`docs/lua-profiler-ptrace.md` describes what exists today and why it is shaped that way.
-This file describes what is *missing* and why we would build it. It is a set of design
-notes, not a promise: ordering inside a tier is a cost/benefit judgment, and every item is
-written so that whoever implements it does not have to re-derive the reasoning.
+### Delivery gates and remaining work
 
-## Where we are
+1. Freeze/resume implemented with RAII cleanup and explicit resume error reporting;
+   Linux tests cover all-thread stops, success/error cleanup, expired budgets and existing
+   job-control stops. Runtime execution, clone/exit races and tracer-death behavior still
+   need acceptance.
+2. Lua 5.4 object enumeration and size validation implemented; C ABI checks and allocator
+   fixtures cover real tables, strings, closures, userdata, coroutines and finalizable tables.
+3. Root/reference decoding, bounded ownership paths, reports and offline inspection are
+   implemented. Validate clarity and scaling on representative workloads.
+4. Weak values are distinguished from strong holders. Weak-key values remain conditional
+   without ephemeron convergence; finalizer semantics remain conservative. Missing references
+   and capture failures mark the result incomplete. No garbage or leak verdict is emitted.
+5. Real skynet acceptance: report clarity, heap coverage, pause cost, and analyzer memory use.
+6. Lua 5.5 layout verification and the same fixture coverage before enabling support.
 
-The **CPU hotspot** axis is done: Lua `CallInfo` walking for 5.4/5.5, native C merge on
-Linux x86_64 and macOS, skynet multi-VM, symbol resolution, and three output modes
-(`record` / `dump` / `top`).
+Reuse process readers, symbols, and VM discovery, but keep heap capture/analysis separate
+from the CPU `Aggregator`. Per-service CPU buckets are not a prerequisite for memory reports.
 
-Two axes are untouched:
+See [the full design](memory-snapshot-design.md) for example output, module boundaries,
+resource limits, and acceptance cases.
 
-- **Time.** The aggregator answers "how often was this function on the stack" but not
-  "how long did this stay on the stack". For a service written against skynet, the
-  interesting failure is rarely a hot function — it is one message that took 340 ms.
-- **Memory.** A sampling profiler that reads `global_State` can see *every* live GC object.
-  That is a completely different question from "where is the CPU", and today tracemoon
-  cannot answer it at all.
+## CPU profiling backlog
 
-## How to read the tiers
+### T1-2 Speedscope output — candidate
 
-- **Tier 1** — self-contained, a day or less each, no new unsafe code, no new layout tables.
-- **Tier 2** — shaped by the skynet use case; touches the aggregator's data model or the
-  first TValue *value* decoding.
-- **Tier 3** — strategic: a new subsystem or a second Lua implementation.
+**Why:** preserve the order of observations so users can inspect changes over a run rather
+than only aggregate flamegraph counts.
 
-Every item states **Why**, **How** (the modules it lands in and the invariants it must not
-break), **Cost**, and **Risk**.
+**Design constraints:**
 
----
+- Record an opt-in, timestamped sample sequence with interned frames and bounded memory.
+- Keep each service's timeline separate in multi-VM mode; stacks collected in one tick
+  must not be serialized as successive time intervals of one combined profile.
+- Preserve gaps, failed observations, and actual elapsed time honestly. Nominal `1/rate`
+  weights alone do not explain delayed ticks.
+- Emit root-to-leaf samples exactly once. The walker yields deepest-first; existing
+  collapsed keys already reverse that order.
+- At 100 Hz and depth 100, one hour of single-VM observations is 36 million frame indices
+  (about 144 MB at four bytes each), before container overhead. Multiple services multiply
+  the cost, so explicit caps and truncation diagnostics are required.
 
-## Tier 1 — cheap and self-contained
+Choose this when temporal inspection becomes a recurring need. It is not required for
+the memory snapshot feature.
 
-### T1-1 Stack residency (long-tail stalls)
+### T1-4 Periodic checkpoints — deferred
 
-**Why.** A sampling profiler's unique advantage over instrumentation is time, and we throw
-it away: `Aggregator` keeps counts only. In skynet, a service that blocks for 300 ms on one
-message contributes 30 samples out of 30 000 — invisible in the flamegraph, and exactly the
-thing an operator cares about.
+Error-path output is implemented; mid-run durability remains separate work.
 
-**How.** Track consecutive runs of the same stack in `src/output/aggregator.rs`:
+For long recording sessions, consider interval-based checkpoints using a temporary file
+and atomic rename. Never write on every sampling tick. Define which output and metadata
+are checkpointed, how failures are surfaced, and how repeated serialization affects sampling.
 
-- `HashMap<stack_key, Streak { started_at: Instant, ticks: u64 }>`.
-- In `add_tick`, every key seen this tick extends its streak; every *unseen* key settles —
-  if `ticks >= threshold` it becomes a candidate for a top-N longest-stall list.
-- Report `Longest stalls:` with duration, the tick offset it started at, and the full stack.
+Current output does not protect against SIGKILL, OOM termination, or reboot.
 
-**Invariants.** The streak counter must be keyed on the **stack**, not on the tick. In
-skynet mode one tick yields one stack *per service*, so a tick-keyed counter would collapse
-"three services stalled simultaneously" into a single stall and report the wrong duration.
-This is the same distinction that `add_tick` vs `sampled_stacks()` already enforces for the
-success rate.
+### T2-1 Per-service split output — deferred
 
-**Cost.** ~100–150 lines plus a test that feeds a synthetic tick sequence (fast tick, long
-stall, fast tick) and asserts the reported duration. `--stall-threshold-ms` (default 100)
-keeps it configurable by time rather than by tick count, so it survives `-r` changes.
+Filtering is implemented; existing synthetic service roots already provide grouping.
+Do not add a redundant `--group-by service` flag without a behavioral need.
 
-**Risk.** Low. No remote reads, no layout, no unsafe.
+If operators need one file per service, add `--split-by-service` with stable handle-based
+identity, safe filenames, shared tick accounting, and consistent metadata. Avoid wrapping
+whole aggregators per service unless the output model actually requires it.
 
-### T1-2 `--format speedscope`
+### T1-1 Consecutive stack observations — needs measurement design
 
-**Why.** The SVG only shows the *aggregate*, and it cannot be diffed. Speedscope
-(`https://www.speedscope.app`) is the de-facto sampled-profile interchange format: Firefox,
-Perfetto and the VS Code profiler all open it, it shows the sample timeline, and it compares
-two files side by side. That is how you answer "what changed between these two runs".
+This could highlight stacks observed repeatedly over a time window. It must not be named
+or presented as measured message latency or a proven stall.
 
-**How.** New `src/output/speedscope.rs` emitting a `SampledFile`:
+Identical samples may come from a hot loop, repeated short requests, blocking, or a suspended
+coroutine; a long-running message can change stacks and break the sequence.
 
-- `shared.frames` — one entry per distinct frame name, interned once.
-- `profiles[0] = { type: "sampled", unit: "seconds", samples: [[frame_ix…]], weights: [1/rate…] }`.
+If pursued, track service identity, stack identity, actual timestamps, and failure/gap
+semantics. Test simultaneous services and sampling jitter. Streaming streak bookkeeping
+does not require storing a full timeline.
 
-**Invariants.**
-- `Aggregator` currently keeps only counts, so this needs an opt-in **per-tick stack
-  sequence**. Store frame indices into an interned table rather than strings
-  (`Vec<Vec<u32>>`), and only when the output format asks for it — an hour at 100 Hz with
-  100 frames deep is ~1.4 M indices, acceptable, but only if interning is in place.
-- Speedscope samples are ordered **root → leaf**, while `StackWalker` yields
-  deepest-first and the aggregator reverses. Re-reverse here explicitly; getting this wrong
-  produces an upside-down (but plausible-looking) profile.
+### T1-5 GC-related sample share — deferred
 
-**Cost.** ~150–200 lines. Main design decision is the per-tick buffer and its memory cap
-(drop-and-warn past `--max-samples` rather than OOM).
+Useful only when observation coverage and symbol availability support it.
 
-**Risk.** Low-medium: the buffer changes `Aggregator`'s shape, so `dump`/`top` call sites
-need a look.
+Do not classify every `luaE_` function as GC. A GC-related symbol on a sampled stack is
+not a precise measurement of time spent collecting, and skynet lacks a merged native chain.
+Define the function set and denominator; unavailable or ambiguous coverage must remain
+unknown rather than being reported as zero.
 
-### T1-3 Profile sidecar metadata
+### T2-2 Idle / blocking classification — needs redesign
 
-**Why.** A flamegraph file detached from its context is not comparable: no pid, no command
-line, no sample rate, no Lua version, no success rate. Archiving and regression-diffing both
-need it.
+The original skynet `epoll_wait` proposal does not fit the current architecture:
+skynet native stacks are intentionally not merged, and a worker's native snapshot cannot
+be attributed directly to a particular service.
 
-**How.** Write `<output>.meta.json` next to the profile:
+For single-VM targets, known blocking symbols may provide clues, but a `read` or `recv`
+frame does not prove the call was blocked. Do not exclude such observations by default
+before defining and validating the semantics; waiting may be precisely what users
+are investigating.
 
-```json
-{ "tracemoon": "0.1.0", "pid": 1234, "command": ["lua", "app.lua"], "lua_version": "5.4",
-  "sample_rate": 100, "duration_secs": 30.0, "ticks": 2996, "success_rate": 99.5,
-  "started_at": "2026-11-20T10:00:00Z" }
-```
+### T2-3 `dump --locals` — deferred pending a concrete debugging need
 
-**Invariant.** Do not add `serde` for six scalars — a 20-line escaper over already-typed
-values keeps the dependency table clean (`AGENTS.md` already treats unused/extra deps as a
-smell). Skip the sidecar when the output goes to stdout.
+Decode active locals from Proto debug information and frame registers, with vararg and
+version-specific layout handling behind existing abstractions.
 
-**Cost.** ~50–80 lines in `collapsed.rs`/`sampler.rs`.
+This introduces value decoding and additional remote reads. A running-process dump is
+not a consistent value snapshot; invalid or torn values must display unknown.
+Missing debug information must not be replaced with invented names.
+Share value-formatting helpers with heap work only where their responsibilities match.
 
-### T1-4 Durable runs (checkpoint + error-path flush)
+## LuaJIT (T3-2) — demand-driven, separate investigation
 
-**Why.** Today `run_profiler` is `sampler.run()?; sampler.generate_output()?;` — if `run`
-returns `Err` (a resolver failure at the wrong moment, an IO error), every sample collected
-so far is discarded. A `-d 0` run that is OOM-killed or reboots loses the whole session.
+LuaJIT support should follow concrete target-user demand. Do not treat it as merely another
+PUC Lua offset-table constructor.
 
-Note what is *not* missing: `ctrlc::set_handler` already covers SIGINT, SIGTERM and SIGHUP,
-so a plain `kill` does exit through the normal path. The gap is mid-run durability and the
-error path.
+First verify LuaJIT's own frame representation, GC64/build configurations, bytecode/debug
+encoding, and JIT trace attribution. Its stacks cannot be designed from PUC Lua
+`CallInfo` assumptions. Interpreter-only coverage and compiled-trace coverage must be
+explicitly distinguished in output.
 
-**How.**
-1. Error paths still flush: `let result = sampler.run(); sampler.generate_output(); result?;`
-   in all three entry points.
-2. `--checkpoint <PATH> --checkpoint-interval <SECS>`: every N seconds write `PATH.tmp` then
-   `rename(2)`, so a reader never observes a half-written file.
+Choose an abstraction after a prototype demonstrates the boundary between the two
+implementations. No one-to-two-week estimate or release commitment is retained.
 
-**Invariant.** Never write on every tick — the sample rate is user-controlled; an
-interval-based checkpoint is the only version that cannot turn a profiler into an IO storm.
+## Non-goals for this roadmap
 
-**Cost.** ~80 lines.
-
-### T1-5 GC share in the statistics
-
-**Why.** Tuning `collectgarbage("setpause")`/`setstepmul` is guesswork without knowing what
-fraction of samples the collector owns.
-
-**How.** In `add_tick`, if any frame name starts with `luaC_`, `lua_gc` or `luaE_`, count the
-tick as a GC tick. Print `GC ticks: 12.3%` in the stats block.
-
-**Invariant.** Report **unknown**, not 0%, when the symbols could not be resolved (a
-stripped interpreter shows `[C]:lua5.4+0x…`). Silently reporting "no GC" for an unresolvable
-binary is worse than reporting nothing.
-
-**Cost.** ~40 lines, pure string matching. Note that C frame names come from the resolver, so
-this is only meaningful once symbols are available — check the smoke output for the shape.
-
----
-
-## Tier 2 — skynet-shaped
-
-### T2-1 Per-service grouping and filtering
-
-**Why.** A skynet process with 100 services produces 100 `[service:name]` roots in one
-flamegraph; the wide-but-flat result is unreadable, and the operator usually wants one
-service or a per-service breakdown.
-
-**How.** `SkynetDiscovery` already yields the service name per VM (`src/process/skynet.rs`).
-Tag each stack at sample time and bucket the aggregator per service
-(`HashMap<Option<String>, Aggregator>`). CLI surface:
-
-- `--service <name>` (repeatable) — profile only those services.
-- `--split-by-service` — one output file per service (`out.<service>.svg`).
-- `--group-by service` — keep the single file but root by service (today's behaviour).
-
-**Cost.** ~150–200 lines. Risk is the aggregator balkanisation rippling into `dump`/`top`;
-consider making the bucket key part of the existing struct rather than wrapping aggregators
-everywhere.
-
-### T2-2 Idle / blocking attribution
-
-**Why.** An idle skynet service sits in `epoll_wait`; nearly every sample lands there, it
-tops every hotspot chart, and it hides the real work. "Waiting" and "working" must be
-separated before the ranking means anything.
-
-**How.** A known-blocking symbol table (`epoll_wait`, `epoll_pwait`, `poll`, `select`,
-`nanosleep`, `pthread_cond_wait`, `futex`, `accept`, `recv*`, `read`) plus a per-tick check:
-if the innermost **C** frame matches, the tick is idle. `--idle` includes idle samples in the
-profile (py-spy's flag); the default excludes them and the stats block reports the idle share.
-
-**Invariant.** Test the innermost *C* frame, not the last frame in the merged stack — the
-aggregator appends the native chain *after* the Lua frames, so "last" is the process entry
-point, not where the thread is parked.
-
-**Cost.** ~100 lines, string matching only, no layout risk.
-
-### T2-3 `dump --locals`
-
-**Why.** `dump` shows the stack but not the values. "Why did it take this branch" is usually
-answered by one variable.
-
-**How.** For each Lua frame, read `Proto.locvars` (`LocVar { varname: TString*, startpc,
-endpc }`) and print every variable with `startpc <= currentpc < endpc`, decoding the value
-from the frame's register window (`ci.func + 1 …`). Handle varargs via `ci.u.l.nextraargs`.
-
-**Risk.** This is the first time the crate decodes a TValue's *value* (today it reads the tag
-only, to pick an address). It needs a value formatter in `layout.rs` plus honest failure:
-torn reads produce garbage, so any value that does not type-check must print `?` rather than
-something plausible.
-
-**Cost.** ~200–300 lines. Highest risk in this tier.
-
----
-
-## Tier 3 — strategic
-
-### T3-1 Memory object sampling (`tracemoon mem`)
-
-**Why.** The highest-value item after CPU profiling. Walking `global_State.allgc` yields
-*every* live GC object, so we can answer "which Lua file's tables are holding 800 MB" — the
-canonical Lua service leak question. It reuses the whole existing skeleton: external reads,
-`LuaLayout` for version drift, the defensive-read discipline.
-
-**How.**
-1. Add a `global_State` offset table to `LuaLayout` (`allgc`, `totalbytes`, `GCdebt`),
-   cross-checked with `#[repr(C)]` + `offset_of!` exactly like the 5.4 `lua_State` table in
-   `types.rs`.
-2. Walk `allgc.next`, dispatching on the object header's `tt` (note the header differs
-   between 5.4 and 5.5 — parametrize it, do not hardcode 5.4's field order).
-3. Size per type: `TString` = header + len (5.5 long strings go through `contents`);
-   `Table` = struct + `sizearray * 16` + node array; `Proto` = struct + each array;
-   `LClosure`/`CClosure` = struct + `nupvalues * 16`; `Udata` = struct + `len`.
-4. Aggregate `Table`/`Proto` by `Proto.source` — that is what turns bytes into an answerable
-   question ("md5.lua").
-
-**Invariants.** The list is live and the collector mutates it while we read. Cap the walk
-(e.g. 10 M objects), tolerate per-object failure, and bound the traversal so a corrupt `next`
-pointer cannot loop forever — the same defensive posture as the `CallInfo` walk, with a
-different loop-detection strategy (min visit count / monotonicity heuristic, because a
-visited-set over millions of nodes is not affordable).
-
-**Cost.** ~500 lines plus a `mem` subcommand. Highest product value in this document.
-
-### T3-2 LuaJIT support
-
-**Why.** It is the largest user population we do not serve.
-
-**Why it is genuinely hard** (this is the part to read before committing to it):
-
-- Different `lua_State` (`base`, `top`, `ci`, `cframe`, …) — a second layout, not a variant
-  of the existing one.
-- Frames live in `CallInfo` with `func`/`pc`/`savedpc`/`nresults`/`callstatus`, but there is
-  no per-instruction `lineinfo` array: line numbers come from `Proto.lineinfo` indexed by
-  `pc - Proto.code`, with a different encoding than 5.4.
-- **JIT-compiled traces have no Lua frames.** Under `-O2` the interpreter is not running, so
-  a large part of the stack is mcode with no `CallInfo` at all. Any implementation must say
-  so in its output rather than presenting a truncated stack as the truth.
-
-**Suggested shape.** A first-class `LuaVersion::Jit` + `lua_jit()` constructor (the reason
-`LuaLayout` exists), scoped initially to accurate walks under `-joff`/`-O0`, then best-effort
-attribution of mcode samples to enclosing traces. One to two weeks, and a separate release.
-
----
-
-## Non-goals
-
-- **Windows.** The audience runs Lua backends on Linux; `remoteprocess` and libunwind-ptrace
-  do not target it.
-- **Lua 5.1–5.3.** Structure differs as much as 5.5 does, and the installed base has moved
-  to 5.4 or LuaJIT.
-- **DWARF line numbers for C frames.** Production processes are stripped; resolving
-  `[C]:lua5.4+0x7e55` honestly is better than shipping a lookup that mostly misses.
-
-## Suggested sequencing
-
-1. **T1-4** first — every later feature wants a run that survives long enough to be
-   inspected, and the error-path flush is a five-line fix with a large payoff.
-2. **T1-1** — half a day, and it changes what the tool can answer.
-3. **T1-3 + T1-5** — same diff, both are small and touch the stats block together.
-4. **T1-2** — needs the per-tick buffer, which also gives T1-1 its streak bookkeeping.
-5. **T2-2** — makes the existing `top` ranking trustworthy before we add more views.
-6. **T2-1** — the aggregator restructure that **T3-1** will also want.
-7. **T3-1** (`mem`) — the first feature in a new dimension.
-8. **T3-2** (LuaJIT) — its own release.
-
-Dependencies worth noting: T1-2 and T1-1 share the per-tick record; T2-1's per-service bucket
-key is also the natural place to attach T3-1's per-service memory totals.
+- Windows support.
+- PUC Lua 5.1–5.3 compatibility work.
+- DWARF source-line lookup for native C frames.
+- Exact message latency from repeated stack samples.
+- Heap allocation-site history reconstructed from an ordinary snapshot.
+- Snapshot comparison before a useful, trustworthy single-snapshot report exists.
