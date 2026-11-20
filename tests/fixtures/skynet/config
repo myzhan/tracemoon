@@ -1,0 +1,11 @@
+-- Run with the built skynet directory as cwd. Fixtures stay in tracemoon's tree.
+-- Two CPU-bound VMs plus a worker for launcher/logger/control messages.
+thread = 3
+harbor = 0
+logger = nil
+bootstrap = "snlua tracemoon_bootstrap"
+cpath = "./cservice/?.so"
+lualoader = "./lualib/loader.lua"
+luaservice = [[$TRACEMOON_FIXTURE_DIR/?.lua;./service/?.lua]]
+lua_path = "./lualib/?.lua;./lualib/?/init.lua"
+lua_cpath = "./luaclib/?.so"

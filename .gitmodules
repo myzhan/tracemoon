@@ -1,0 +1,6 @@
+[submodule "tests/vendor/lua"]
+	path = tests/vendor/lua
+	url = https://github.com/lua/lua.git
+[submodule "tests/vendor/skynet"]
+	path = tests/vendor/skynet
+	url = https://github.com/cloudwu/skynet.git
