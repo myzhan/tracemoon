@@ -4,7 +4,7 @@ use std::cell::Cell;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use log::{debug, info, warn};
 use remoteprocess::Pid;
@@ -73,6 +73,8 @@ pub struct Sampler {
     aggregator: Aggregator,
     running: Arc<AtomicBool>,
     start_time: Instant,
+    started_at: SystemTime,
+    elapsed: Duration,
 }
 
 impl Sampler {
@@ -87,7 +89,7 @@ impl Sampler {
         // Pick the Lua layout: explicit override, else auto-detect. Detection may
         // legitimately fail here (spawn mode stops the child before the loader runs), in
         // which case we start from 5.4 and keep re-detecting until a VM confirms it.
-        let (layout, layout_fixed) = match config.lua_version {
+        let (mut layout, layout_fixed) = match config.lua_version {
             Some(v) => (LuaLayout::for_version(v), true),
             None => match detect_lua_version(pid) {
                 Some(v) => (LuaLayout::for_version(v), true),
@@ -109,6 +111,14 @@ impl Sampler {
             info!("single-VM mode: lua_State will be discovered on first sample");
             Mode::Single { addr: Cell::new(0) }
         };
+        if matches!(mode, Mode::Skynet { .. }) {
+            layout = LuaLayout::for_skynet(layout.version);
+        }
+        if !config.services.is_empty() && matches!(mode, Mode::Single { .. }) {
+            return Err(TracemoonError::Config(
+                "--service requires a skynet target (H symbol must be resolvable)".into(),
+            ));
+        }
 
         // Native C-stack unwinder is meaningful only for a single VM: a ptrace register
         // snapshot maps to one worker thread, not to a specific skynet service.
@@ -134,6 +144,8 @@ impl Sampler {
             aggregator: Aggregator::new(),
             running: Arc::new(AtomicBool::new(true)),
             start_time: Instant::now(),
+            started_at: SystemTime::now(),
+            elapsed: Duration::ZERO,
         })
     }
 
@@ -148,6 +160,15 @@ impl Sampler {
 
     /// Run the sampling loop
     pub fn run(&mut self) -> Result<()> {
+        self.start_time = Instant::now();
+        self.started_at = SystemTime::now();
+        let result = self.run_inner();
+        // Freeze the duration before child cleanup and output IO add unrelated time.
+        self.elapsed = self.start_time.elapsed();
+        result
+    }
+
+    fn run_inner(&mut self) -> Result<()> {
         info!(
             "Starting sampling at {} Hz for {} seconds",
             self.config.sample_rate,
@@ -164,7 +185,6 @@ impl Sampler {
             child.resume()?;
         }
 
-        self.start_time = Instant::now();
         let sample_interval = Duration::from_secs_f64(1.0 / self.config.sample_rate as f64);
         let duration_limit = if self.config.duration > 0 {
             Some(Duration::from_secs(self.config.duration))
@@ -331,7 +351,11 @@ impl Sampler {
         self.last_detect.set(Some(now));
 
         if let Some(version) = detect_lua_version(self.pid()) {
-            let detected = LuaLayout::for_version(version);
+            let detected = if matches!(self.mode, Mode::Skynet { .. }) {
+                LuaLayout::for_skynet(version)
+            } else {
+                LuaLayout::for_version(version)
+            };
             if detected.version != self.layout.get().version {
                 info!(
                     "Detected Lua {} after start-up; switching memory layout",
@@ -421,7 +445,13 @@ impl Sampler {
         let mut stacks = Vec::new();
 
         for vm in vms {
+            if !service_selected(&self.config.services, &vm.label, vm.handle) {
+                continue;
+            }
             let mut lua_frames = match walker.walk(vm.lua_state_addr) {
+                // A synthetic service root alone must not turn a failed walk into a
+                // successful tick, especially when filtering to a single service.
+                Ok(f) if f.is_empty() => continue,
                 Ok(f) => f,
                 Err(e) => {
                     debug!(
@@ -452,7 +482,7 @@ impl Sampler {
 
     /// Generate output
     pub fn generate_output(&self) -> Result<()> {
-        let duration = self.start_time.elapsed().as_secs_f64();
+        let duration = self.elapsed.as_secs_f64();
         let output = CollapsedOutput::new(&self.aggregator);
 
         let output_path = self.config.output_file.as_deref().unwrap_or("profile.txt");
@@ -467,6 +497,17 @@ impl Sampler {
             output.write_file(output_path).map_err(TracemoonError::Io)?;
             info!("Output written to {}", output_path);
         }
+
+        crate::output::metadata::ProfileMetadata {
+            config: &self.config,
+            pid: self.pid(),
+            lua_version: self.layout.get().version,
+            layout_confirmed: self.layout_fixed.get(),
+            started_at: self.started_at,
+            elapsed: self.elapsed,
+            aggregator: &self.aggregator,
+        }
+        .write(&format!("{}.meta.json", output_path))?;
 
         output
             .write_stats_stderr(duration)
@@ -485,12 +526,8 @@ pub fn run_profiler(pid: Pid, config: Config) -> Result<()> {
     ctrlc_setup(running)?;
 
     // Run sampling loop
-    sampler.run()?;
-
-    // Generate output
-    sampler.generate_output()?;
-
-    Ok(())
+    let run_result = sampler.run();
+    finish_record(run_result, sampler.generate_output())
 }
 
 /// Run the profiler by spawning a child process and profiling from its start.
@@ -512,12 +549,27 @@ pub fn run_profiler_spawn(argv: Vec<String>, mut config: Config) -> Result<()> {
         child.terminate();
     }
 
-    run_result?;
+    finish_record(run_result, sampler.generate_output())
+}
 
-    // Generate output
-    sampler.generate_output()?;
+fn service_selected(selectors: &[String], label: &str, handle: u32) -> bool {
+    selectors.is_empty()
+        || selectors
+            .iter()
+            .any(|s| s == label || s == &format!(":{:08x}", handle))
+}
 
-    Ok(())
+// Always attempt output, but preserve the original failure if both operations fail.
+fn finish_record(run: Result<()>, output: Result<()>) -> Result<()> {
+    match (run, output) {
+        (Err(error), output) => {
+            if let Err(output_error) = output {
+                warn!("Could not save partial profile: {}", output_error);
+            }
+            Err(error)
+        }
+        (Ok(()), output) => output,
+    }
 }
 
 /// Build a sampler for either an attach PID or a spawned command.
@@ -608,6 +660,7 @@ pub fn run_top(pid: Option<Pid>, argv: Option<Vec<String>>, mut config: Config) 
 
     sampler.terminate_child();
 
+    sampler.render_top();
     run_result?;
 
     Ok(())
@@ -626,6 +679,28 @@ fn ctrlc_setup(running: Arc<AtomicBool>) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
 
-    // Integration tests would require a running Lua process
+    #[test]
+    fn service_selection_is_exact_and_accepts_named_service_handles() {
+        assert!(service_selected(&[], ".logger", 0x1000012));
+        assert!(service_selected(&[".logger".into()], ".logger", 0x1000012));
+        assert!(service_selected(
+            &[":01000012".into()],
+            ".logger",
+            0x1000012
+        ));
+        assert!(!service_selected(&["logger".into()], ".logger", 0x1000012));
+    }
+
+    #[test]
+    fn output_failure_does_not_hide_sampling_failure() {
+        let run = Err(TracemoonError::ProcessExited);
+        let output = Err(TracemoonError::Other("disk full".into()));
+        assert!(matches!(
+            finish_record(run, output),
+            Err(TracemoonError::ProcessExited)
+        ));
+        assert!(finish_record(Ok(()), Err(TracemoonError::Other("disk full".into()))).is_err());
+    }
 }

@@ -125,6 +125,18 @@ pub struct LuaLayout {
 }
 
 impl LuaLayout {
+    /// Skynet's Lua 5.4 fork inserts a string ID before the length/link union.
+    /// Release strings still say 5.4, so version detection alone cannot select this ABI.
+    pub fn for_skynet(version: LuaVersion) -> Self {
+        let mut layout = Self::for_version(version);
+        if version == LuaVersion::Lua54 {
+            layout.ts_lnglen = 24;
+            layout.ts_short_data = 32;
+            layout.ts_long_data = 32;
+        }
+        layout
+    }
+
     pub fn for_version(version: LuaVersion) -> Self {
         match version {
             LuaVersion::Lua54 => Self::lua54(),
@@ -342,6 +354,24 @@ mod tests {
     use crate::lua::types::{CallInfo, LClosure, LuaState, Proto, TString, TValue, Upvaldesc};
     use crate::process::reader::testing::WindowReader;
     use std::mem::{offset_of, size_of};
+
+    #[test]
+    fn skynet54_strings_include_the_forks_extra_id_field() {
+        let layout = LuaLayout::for_skynet(LuaVersion::Lua54);
+        assert_eq!(
+            (layout.ts_lnglen, layout.ts_short_data, layout.ts_long_data),
+            (24, 32, 32)
+        );
+        let mut reader = WindowReader::new(0x1000, 256);
+        reader.write_u8(0x1008, 4);
+        reader.write_u8(0x100b, 9);
+        reader.write_u64(0x1010, 123456); // TString.id is not length or string data.
+        reader.write(0x1020, b"@test.lua");
+        assert_eq!(layout.read_lua_string(&reader, 0x1000).unwrap(), "test.lua");
+        reader.write_u8(0x1008, 20);
+        reader.write_u64(0x1018, 9);
+        assert_eq!(layout.read_lua_string(&reader, 0x1000).unwrap(), "test.lua");
+    }
 
     #[test]
     fn lua54_matches_reference_structs() {

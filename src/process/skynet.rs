@@ -36,9 +36,14 @@ const CTX_HANDLE: usize = 96;
 // --- snlua ---
 const SNLUA_ACTIVEL: usize = 40;
 
+fn at(base: usize, offset: usize) -> usize {
+    base.saturating_add(offset)
+}
+
 /// One discovered Lua VM (a skynet service's running coroutine).
 #[derive(Debug, Clone)]
 pub struct LuaVm {
+    pub handle: u32,
     pub lua_state_addr: usize,
     pub label: String,
 }
@@ -79,10 +84,10 @@ impl<'a> SkynetDiscovery<'a> {
             return Ok(Vec::new());
         }
 
-        let slot_size = read_struct::<i32>(r, hs + HS_SLOT_SIZE)? as usize;
-        let slot = read_struct::<u64>(r, hs + HS_SLOT)? as usize;
-        let name_count = read_struct::<i32>(r, hs + HS_NAME_COUNT)?;
-        let name_arr = read_struct::<u64>(r, hs + HS_NAME)? as usize;
+        let slot_size = read_struct::<i32>(r, at(hs, HS_SLOT_SIZE))? as usize;
+        let slot = read_struct::<u64>(r, at(hs, HS_SLOT))? as usize;
+        let name_count = read_struct::<i32>(r, at(hs, HS_NAME_COUNT))?;
+        let name_arr = read_struct::<u64>(r, at(hs, HS_NAME))? as usize;
 
         if slot < 0x1000 || slot_size == 0 || slot_size > 1_000_000 {
             debug!(
@@ -94,7 +99,7 @@ impl<'a> SkynetDiscovery<'a> {
 
         let mut vms = Vec::new();
         for i in 0..slot_size {
-            let ctx = match read_struct::<u64>(r, slot + i * 8) {
+            let ctx = match read_struct::<u64>(r, at(slot, i.saturating_mul(8))) {
                 Ok(v) => v as usize,
                 Err(_) => continue,
             };
@@ -103,7 +108,7 @@ impl<'a> SkynetDiscovery<'a> {
             }
 
             // instance is a snlua* for snlua services (0/garbage for C services).
-            let instance = match read_struct::<u64>(r, ctx + CTX_INSTANCE) {
+            let instance = match read_struct::<u64>(r, at(ctx, CTX_INSTANCE)) {
                 Ok(v) => v as usize,
                 Err(_) => continue,
             };
@@ -111,7 +116,7 @@ impl<'a> SkynetDiscovery<'a> {
                 continue;
             }
 
-            let active_l = match read_struct::<u64>(r, instance + SNLUA_ACTIVEL) {
+            let active_l = match read_struct::<u64>(r, at(instance, SNLUA_ACTIVEL)) {
                 Ok(v) => v as usize,
                 Err(_) => continue,
             };
@@ -119,13 +124,14 @@ impl<'a> SkynetDiscovery<'a> {
                 continue;
             }
 
-            let handle = read_struct::<u32>(r, ctx + CTX_HANDLE).unwrap_or(0);
+            let handle = read_struct::<u32>(r, at(ctx, CTX_HANDLE)).unwrap_or(0);
             let label = self
                 .resolve_name(name_arr, name_count, handle)
                 .unwrap_or_else(|| format!(":{:08x}", handle));
 
             debug!("service {} -> activeL 0x{:x}", label, active_l);
             vms.push(LuaVm {
+                handle,
                 lua_state_addr: active_l,
                 label,
             });
@@ -137,16 +143,16 @@ impl<'a> SkynetDiscovery<'a> {
 
     /// Look up a service's registered name by handle in the name table.
     fn resolve_name(&self, name_arr: usize, name_count: i32, handle: u32) -> Option<String> {
-        if name_arr < 0x1000 || name_count <= 0 || handle == 0 {
+        if name_arr < 0x1000 || name_count <= 0 || name_count > 1_000_000 || handle == 0 {
             return None;
         }
         for i in 0..name_count as usize {
-            let entry = name_arr + i * HN_STRIDE;
-            let h = read_struct::<u32>(self.reader, entry + HN_HANDLE).ok()?;
+            let entry = at(name_arr, i.saturating_mul(HN_STRIDE));
+            let h = read_struct::<u32>(self.reader, at(entry, HN_HANDLE)).ok()?;
             if h != handle {
                 continue;
             }
-            let name_ptr = read_struct::<u64>(self.reader, entry + HN_NAME).ok()? as usize;
+            let name_ptr = read_struct::<u64>(self.reader, at(entry, HN_NAME)).ok()? as usize;
             if name_ptr < 0x1000 {
                 return None;
             }

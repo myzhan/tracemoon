@@ -16,6 +16,8 @@ proc-maps = "0.4"
 read-process-memory = "0.1"
 object = { version = "0.36", default-features = false, features = ["read", "elf", "macho", "std"] }
 inferno = { version = "0.12", default-features = false }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 
 [target.'cfg(unix)'.dependencies]
 nix = { version = "0.27", features = ["process", "ptrace", "signal"] }

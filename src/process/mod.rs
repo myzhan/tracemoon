@@ -1,4 +1,5 @@
 pub mod discovery;
+pub mod freeze;
 pub mod native_stack;
 pub mod reader;
 pub mod skynet;

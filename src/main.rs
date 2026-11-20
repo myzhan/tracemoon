@@ -10,6 +10,7 @@ extern crate log;
 mod config;
 mod error;
 mod lua;
+mod memory;
 mod output;
 mod process;
 mod sampler;
@@ -49,10 +50,15 @@ fn check_permissions() {
 
 fn run() -> Result<(), TracemoonError> {
     let config = Config::from_commandline();
+    let offline_memory = matches!(config.memory, Some(memory::MemoryCommand::Report { .. }));
+    if !offline_memory {
+        check_permissions();
+    }
 
     // dump/top validate the target internally (via build_target); record keeps its
     // existing attach-vs-spawn split so spawn owns the child lifecycle.
     match config.mode {
+        RunMode::Memory => return memory::run(config.memory.expect("memory CLI configuration")),
         RunMode::Dump => return run_dump(config.pid, config.command.clone(), config),
         RunMode::Top => return run_top(config.pid, config.command.clone(), config),
         RunMode::Record => {}
@@ -91,9 +97,6 @@ fn main() -> ExitCode {
         .filter_level(log::LevelFilter::Info)
         .parse_default_env()
         .init();
-
-    // Check permissions and print warnings
-    check_permissions();
 
     // Run the profiler
     match run() {

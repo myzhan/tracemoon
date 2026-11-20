@@ -9,6 +9,9 @@ Cargo.lock
 *.txt
 profile.*
 flamegraph.*
+*.tmoon
+*.tmoon.*.tmp
+*.meta.json
 
 # ...but keep the sample flamegraphs referenced from the README
 !assets/*.svg

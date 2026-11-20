@@ -15,6 +15,7 @@ pub const DEFAULT_DURATION: u64 = 0;
 /// Output mode selected by the subcommand.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum RunMode {
+    Memory,
     /// Sample for a duration and write a flamegraph / collapsed file.
     Record,
     /// Print a one-shot snapshot of the current stack(s) and exit.
@@ -25,6 +26,7 @@ pub enum RunMode {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Config {
+    pub memory: Option<crate::memory::MemoryCommand>,
     /// Output mode (record / dump / top).
     pub mode: RunMode,
 
@@ -45,11 +47,15 @@ pub struct Config {
 
     /// Command to spawn and profile (after `--`). Mutually exclusive with `pid`.
     pub command: Option<Vec<String>>,
+
+    /// Exact skynet service labels or :xxxxxxxx handles; empty selects all services.
+    pub services: Vec<String>,
 }
 
 impl Default for Config {
     fn default() -> Self {
         Self {
+            memory: None,
             mode: RunMode::Record,
             pid: None,
             sample_rate: DEFAULT_SAMPLE_RATE,
@@ -57,6 +63,7 @@ impl Default for Config {
             output_file: None,
             lua_version: None,
             command: None,
+            services: Vec::new(),
         }
     }
 }
@@ -87,6 +94,7 @@ impl Config {
             .about("Print a one-shot snapshot of the current stack(s) and exit")
             .arg(pid_arg())
             .arg(lua_version_arg())
+            .arg(service_arg())
             .arg(command_arg());
 
         let top_cmd = Command::new("top")
@@ -97,6 +105,7 @@ impl Config {
             .version(crate_version!())
             .about("A sampling profiler for Lua (5.4 / 5.5, incl. skynet multi-VM)")
             .subcommand_required(true)
+            .subcommand(crate::memory::cli())
             .subcommand(record_cmd)
             .subcommand(dump_cmd)
             .subcommand(top_cmd);
@@ -104,6 +113,11 @@ impl Config {
         let matches = app.try_get_matches_from(args)?;
 
         let mut config = Config::default();
+        if let Some(("mem", args)) = matches.subcommand() {
+            config.mode = RunMode::Memory;
+            config.memory = Some(crate::memory::parse(args)?);
+            return Ok(config);
+        }
 
         let (mode, sub_matches) = match matches.subcommand() {
             Some(("record", m)) => (RunMode::Record, m),
@@ -112,6 +126,10 @@ impl Config {
             _ => return Ok(config),
         };
         config.mode = mode;
+        config.services = sub_matches
+            .values_of("service")
+            .map(|values| values.map(String::from).collect())
+            .unwrap_or_default();
 
         // PID (optional; attach path)
         if let Some(pid_str) = sub_matches.value_of("pid") {
@@ -215,6 +233,15 @@ fn command_arg() -> Arg<'static> {
         .takes_value(true)
 }
 
+fn service_arg() -> Arg<'static> {
+    Arg::new("service")
+        .long("service")
+        .value_name("NAME_OR_HANDLE")
+        .help("Select a skynet service by exact label or :xxxxxxxx handle (repeatable)")
+        .takes_value(true)
+        .multiple_occurrences(true)
+}
+
 /// Args shared by `record` and `top` (dump uses a narrower subset).
 fn shared_args() -> Vec<Arg<'static>> {
     vec![
@@ -234,6 +261,7 @@ fn shared_args() -> Vec<Arg<'static>> {
             .default_value("0")
             .takes_value(true),
         lua_version_arg(),
+        service_arg(),
         command_arg(),
     ]
 }
@@ -249,6 +277,25 @@ mod tests {
         assert_eq!(config.sample_rate, 100);
         assert_eq!(config.duration, 0);
         assert_eq!(config.output_file, None);
+    }
+
+    #[test]
+    fn service_filters_are_repeatable_in_every_mode() {
+        for mode in ["record", "top", "dump"] {
+            let args = [
+                "tracemoon",
+                mode,
+                "-p",
+                "123",
+                "--service",
+                ".logger",
+                "--service",
+                ":01000012",
+            ]
+            .map(String::from);
+            let config = Config::from_args(&args).unwrap();
+            assert_eq!(config.services, [".logger", ":01000012"]);
+        }
     }
 
     #[test]
