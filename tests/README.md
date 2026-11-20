@@ -22,7 +22,9 @@ bash tests/build-vendor.sh
 The build script requires Git, make, a C compiler, and standard platform development tools.
 It archives each checked-out commit into `target/test-vendor/<name>-<commit>-<platform>` and
 builds there. Vendor working trees remain clean. Re-running it reuses the build for that
-commit. Run it again after changing a submodule pin; integration tests reject stale builds.
+commit; a restored directory that no longer contains its makefile is re-extracted instead of
+being trusted, because CI caches `target/` across runs. Run it again after changing a
+submodule pin; integration tests reject stale builds.
 Do not run multiple instances of this build script concurrently in one checkout.
 
 The skynet build disables jemalloc and its malloc hook; Lua heaps and real service scheduling

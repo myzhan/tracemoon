@@ -12,9 +12,15 @@ case "$(uname -s)" in
   *) echo "Unsupported test vendor platform" >&2; exit 1 ;;
 esac
 
+# Lua ships `makefile` (lowercase), skynet ships `Makefile`. macOS is case-insensitive and
+# Linux is not, so both names have to be tested explicitly.
+has_makefile() {
+  test -f "$1/Makefile" || test -f "$1/makefile"
+}
+
 archive_source() {
   local name="$1" vendor="$project_root/tests/vendor/$1" revision destination
-  test -f "$vendor/lua.h" || test -f "$vendor/Makefile" || {
+  test -f "$vendor/lua.h" || has_makefile "$vendor" || {
     echo "Missing $name submodule. Run: git submodule update --init tests/vendor/lua tests/vendor/skynet" >&2
     exit 1
   }
@@ -22,11 +28,11 @@ archive_source() {
   destination="$build_root/$name-$revision-$platform"
   # A restored CI cache can leave an empty or half-populated directory behind, so only a
   # tree that still has its makefile counts as an extracted vendor.
-  if ! test -f "$destination/Makefile"; then
+  if ! has_makefile "$destination"; then
     local staging
     staging="$(mktemp -d "$build_root/$name.XXXXXX")"
     git -C "$vendor" archive HEAD | tar -xf - -C "$staging"
-    test -f "$staging/Makefile" || {
+    has_makefile "$staging" || {
       echo "Empty $name vendor archive for $revision" >&2
       exit 1
     }
