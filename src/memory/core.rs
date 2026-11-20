@@ -204,10 +204,14 @@ impl Image {
                     self.file_note(data)?;
                 }
                 if kind == 6 {
-                    for entry in data.chunks_exact(16) {
+                    // `split_first_chunk` keeps the fixed-width walk explicit without
+                    // tripping clippy's `chunks_exact` → `as_chunks` suggestion (Rust 1.88+).
+                    let mut entries = data;
+                    while let Some((entry, rest)) = entries.split_first_chunk::<16>() {
                         if word(entry, 0)? == 3 {
                             self.phdr = Some(word(entry, 8)?);
                         }
+                        entries = rest;
                     }
                 }
             }

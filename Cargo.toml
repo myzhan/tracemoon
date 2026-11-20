@@ -10,7 +10,6 @@ remoteprocess = {version="0.5.0", features=["unwind"]}
 libc = "0.2"
 log = "0.4"
 thiserror = "1"
-memmap2 = "0.9"
 ctrlc = "3"
 proc-maps = "0.4"
 read-process-memory = "0.1"
