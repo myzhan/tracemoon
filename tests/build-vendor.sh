@@ -20,10 +20,17 @@ archive_source() {
   }
   revision="$(git -C "$vendor" rev-parse HEAD)"
   destination="$build_root/$name-$revision-$platform"
-  if ! test -d "$destination"; then
+  # A restored CI cache can leave an empty or half-populated directory behind, so only a
+  # tree that still has its makefile counts as an extracted vendor.
+  if ! test -f "$destination/Makefile"; then
     local staging
     staging="$(mktemp -d "$build_root/$name.XXXXXX")"
     git -C "$vendor" archive HEAD | tar -xf - -C "$staging"
+    test -f "$staging/Makefile" || {
+      echo "Empty $name vendor archive for $revision" >&2
+      exit 1
+    }
+    rm -rf -- "$destination"
     mv "$staging" "$destination"
   fi
   printf '%s\n' "$destination"
